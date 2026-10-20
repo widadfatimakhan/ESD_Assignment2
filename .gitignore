@@ -13,3 +13,14 @@ Thumbs.db
 # Runtime logs
 logs/
 *.log
+
+# Test caches
+.pytest_cache/
+
+# Local database files / data volumes (never submit these)
+data/
+*.db
+*.sqlite3
+
+# Secrets
+.env

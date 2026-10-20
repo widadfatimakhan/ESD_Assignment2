@@ -17,6 +17,7 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DATABASE_WAL=true
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
     depends_on:

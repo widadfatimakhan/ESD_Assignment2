@@ -1,9 +1,11 @@
-# StudySlot: Observability Assignment (ESD)
+# StudySlot (ESD Assignments)
 
 A campus study-room booking service (Python + FastAPI) instrumented end to end
 with Prometheus + Grafana (metrics) and Filebeat + Elasticsearch + Kibana
-(logs), all run with Docker Compose. See `REPORT.md` for the full write-up
-(Parts A–E).
+(logs), all run with Docker Compose.
+
+- **Assignment 2** (HTTP APIs, gRPC, metrics): report in `REPORT.md` (in progress)
+- **Assignment 1** (observability): [docs/a1/REPORT.md](docs/a1/REPORT.md)
 
 ## What it does
 Students book a limited group study room for a time slot, listing their group's
