@@ -274,6 +274,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       },
@@ -528,6 +538,48 @@
           }
         }
       }
+    },
+    "/chaos/failures": {
+      "put": {
+        "tags": [
+          "chaos"
+        ],
+        "summary": "Set Failures",
+        "description": "Make the next N POST /bookings requests fail with 503 (simulated outage). 0 turns it off.",
+        "operationId": "set_failures_chaos_failures_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FailureSetting"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -676,12 +728,17 @@
           "cardinality_bomb": {
             "type": "boolean",
             "title": "Cardinality Bomb"
+          },
+          "fail_next_bookings": {
+            "type": "integer",
+            "title": "Fail Next Bookings"
           }
         },
         "type": "object",
         "required": [
           "delay_seconds",
-          "cardinality_bomb"
+          "cardinality_bomb",
+          "fail_next_bookings"
         ],
         "title": "ChaosState"
       },
@@ -760,6 +817,22 @@
           "error"
         ],
         "title": "ErrorResponse"
+      },
+      "FailureSetting": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Count",
+            "description": "How many of the next POST /bookings requests fail with 503; 0 turns it off"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count"
+        ],
+        "title": "FailureSetting"
       },
       "FreeRoom": {
         "properties": {

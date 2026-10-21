@@ -151,6 +151,18 @@ def test_availability_is_rate_limited(client):
     assert 1 <= int(refused.headers["Retry-After"]) <= 10
 
 
+# --- Chaos: injected failures (used by the Python caller demo) -------------------
+def test_injected_failure_returns_503_then_recovers(client, booking_body):
+    client.put("/chaos/failures", json={"count": 1})
+
+    failed = client.post("/bookings", json=booking_body)
+    succeeded = client.post("/bookings", json=booking_body)
+
+    assert_error(failed, 503, "service_unavailable")
+    assert succeeded.status_code == 201
+    assert client.get("/chaos").json()["fail_next_bookings"] == 0
+
+
 # --- Shared behaviour -----------------------------------------------------------
 def test_unknown_path_uses_error_format(client):
     assert_error(client.get("/no-such-path"), 404, "not_found")

@@ -47,6 +47,12 @@ header. Cancel it with `DELETE /bookings/{id}`.
   make ~15–20 bookings, run `count(studyslot_requests_by_id_total)` in Prometheus
   and watch series grow; `PUT /chaos/cardinality` with `{"active": false}` to stop.
 - Check current chaos state: `GET /chaos`.
+- **Injected outage (A2):** `PUT /chaos/failures` with `{"count": 3}` makes the next 3
+  `POST /bookings` calls return 503; `{"count": 0}` turns it off.
+- **Python caller demo (A2):** `.venv\Scripts\python scripts/booking_caller.py`
+  shows timeout, retry with backoff, and the circuit breaker opening and recovering.
+- **Rate-limit demo (A2):** `python scripts/rate_limit_demo.py`
+- **Tests:** `.venv\Scripts\python -m pytest -v`
 
 ## Stop and clean up
 - Pause (keeps data): `docker compose stop`

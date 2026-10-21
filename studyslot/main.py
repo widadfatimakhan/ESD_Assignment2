@@ -5,6 +5,7 @@ metrics and chaos switches. The booking rules live in booking_core.py and the
 data in db.py, so the gRPC service (Part B) reuses exactly the same rules and data.
 """
 import re
+import threading
 import time
 import uuid
 from http import HTTPStatus
@@ -69,6 +70,25 @@ ROOMS_OCCUPIED.set_function(db.count_bookings)
 
 # Chaos: artificial delay (seconds) injected into the availability check. 0 = off.
 INJECTED_DELAY = 0.0
+
+# Chaos: the next N POST /bookings requests fail with 503, as if the service
+# were briefly down. Used to demonstrate the caller's retries and circuit breaker.
+FAIL_NEXT_BOOKINGS = 0
+_chaos_lock = threading.Lock()
+
+
+class InjectedFailure(Exception):
+    """Simulated outage: main.py turns this into 503 Service Unavailable."""
+
+
+def consume_injected_failure() -> bool:
+    """True if this request should fail (and counts it down)."""
+    global FAIL_NEXT_BOOKINGS
+    with _chaos_lock:
+        if FAIL_NEXT_BOOKINGS > 0:
+            FAIL_NEXT_BOOKINGS -= 1
+            return True
+    return False
 
 AVAILABILITY_CHECK_SECONDS = Histogram(
     "studyslot_availability_check_seconds",
@@ -180,6 +200,12 @@ async def handle_rate_limited(request: Request, exc: RateLimitExceeded):
     )
 
 
+@app.exception_handler(InjectedFailure)
+async def handle_injected_failure(request: Request, exc: InjectedFailure):
+    return error_response(request, 503, "service_unavailable",
+                          "The booking service is temporarily unavailable (injected failure). Try again shortly.")
+
+
 @app.exception_handler(Exception)
 async def handle_unexpected_error(request: Request, exc: Exception):
     log_event("unhandled error", level="ERROR", path=request.url.path, error=repr(exc))
@@ -200,7 +226,8 @@ RATE_LIMIT_HEADERS = {
 def errors(*codes: int) -> dict:
     """OpenAPI helper: document that these status codes return ErrorResponse."""
     descriptions = {400: "Malformed request", 404: "Not found", 409: "Conflict",
-                    422: "Invalid input or broken booking rule", 429: "Too many requests"}
+                    422: "Invalid input or broken booking rule", 429: "Too many requests",
+                    503: "Service temporarily unavailable"}
     docs = {c: {"model": ErrorResponse, "description": descriptions.get(c, "Error")} for c in codes}
     if 429 in docs:
         docs[429]["headers"] = {
@@ -266,9 +293,14 @@ class CardinalitySetting(BaseModel):
     active: bool
 
 
+class FailureSetting(BaseModel):
+    count: int = Field(ge=0, le=100, description="How many of the next POST /bookings requests fail with 503; 0 turns it off")
+
+
 class ChaosState(BaseModel):
     delay_seconds: float
     cardinality_bomb: bool
+    fail_next_bookings: int
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +363,7 @@ def availability(
                         "Location": header_doc("URL of the booking, e.g. /bookings/{id}"),
                         "Idempotent-Replayed": header_doc("'true' when this is a replay of an earlier request"),
                     }},
-              **errors(400, 409, 422),
+              **errors(400, 409, 422, 503),
           })
 def create_booking(
     req: BookingRequest,
@@ -350,6 +382,9 @@ def create_booking(
     A replayed request (same Idempotency-Key, same body) returns the original 201
     response with the header `Idempotent-Replayed: true`.
     """
+    if consume_injected_failure():     # chaos: simulated outage
+        log_event("booking failed", level="ERROR", status=503, reason="injected_failure")
+        raise InjectedFailure()
     if CARDINALITY_BOMB_ON:
         CARDINALITY_DEMO.labels(request_id=request_id_var.get()).inc()
 
@@ -424,7 +459,8 @@ def metrics():
 
 # --- Chaos switches (from A1) ---
 def chaos_state() -> dict:
-    return {"delay_seconds": INJECTED_DELAY, "cardinality_bomb": CARDINALITY_BOMB_ON}
+    return {"delay_seconds": INJECTED_DELAY, "cardinality_bomb": CARDINALITY_BOMB_ON,
+            "fail_next_bookings": FAIL_NEXT_BOOKINGS}
 
 
 @app.get("/chaos", response_model=ChaosState, tags=["chaos"])
@@ -448,4 +484,14 @@ def set_cardinality(setting: CardinalitySetting):
     global CARDINALITY_BOMB_ON
     CARDINALITY_BOMB_ON = setting.active
     log_event("chaos cardinality set", level="WARNING", cardinality_bomb=setting.active)
+    return chaos_state()
+
+
+@app.put("/chaos/failures", response_model=ChaosState, responses=errors(422), tags=["chaos"])
+def set_failures(setting: FailureSetting):
+    """Make the next N POST /bookings requests fail with 503 (simulated outage). 0 turns it off."""
+    global FAIL_NEXT_BOOKINGS
+    with _chaos_lock:
+        FAIL_NEXT_BOOKINGS = setting.count
+    log_event("chaos failures set", level="WARNING", fail_next_bookings=setting.count)
     return chaos_state()
