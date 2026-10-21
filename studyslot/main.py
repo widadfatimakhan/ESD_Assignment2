@@ -12,7 +12,8 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.openapi.docs import get_redoc_html
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import (
     Counter, Gauge, Histogram, Summary,
@@ -30,7 +31,16 @@ db.init_db()   # create the database file and table on startup if needed
 app = FastAPI(
     title="StudySlot",
     version="2.0.0",
-    description="Campus study-room booking service (ESD Assignment 2).",
+    description=(
+        "Campus study-room booking service (ESD Assignment 2).\n\n"
+        "- Every response carries an `X-Request-ID` header. Send your own to correlate calls; "
+        "otherwise one is generated. The same ID appears in the logs and in error bodies.\n"
+        "- Every error uses the `ErrorResponse` shape: `{\"error\": {\"code\", \"message\", "
+        "\"request_id\", \"details\"}}`.\n"
+        "- `POST /bookings` accepts an `Idempotency-Key` header so retries are safe.\n"
+        "- `GET /availability` is rate limited to 5 calls per 10 seconds per client IP."
+    ),
+    redoc_url=None,   # replaced by the /redoc route below (FastAPI's default ReDoc link is broken)
 )
 
 # ---------------------------------------------------------------------------
@@ -176,11 +186,28 @@ async def handle_unexpected_error(request: Request, exc: Exception):
     return error_response(request, 500, "internal_error", "Something went wrong on our side.")
 
 
+def header_doc(description: str, type_: str = "string") -> dict:
+    """OpenAPI helper: describe one response header."""
+    return {"description": description, "schema": {"type": type_}}
+
+
+RATE_LIMIT_HEADERS = {
+    "X-RateLimit-Limit": header_doc("Calls allowed per window", "integer"),
+    "X-RateLimit-Remaining": header_doc("Calls left in the current window", "integer"),
+}
+
+
 def errors(*codes: int) -> dict:
     """OpenAPI helper: document that these status codes return ErrorResponse."""
     descriptions = {400: "Malformed request", 404: "Not found", 409: "Conflict",
                     422: "Invalid input or broken booking rule", 429: "Too many requests"}
-    return {c: {"model": ErrorResponse, "description": descriptions.get(c, "Error")} for c in codes}
+    docs = {c: {"model": ErrorResponse, "description": descriptions.get(c, "Error")} for c in codes}
+    if 429 in docs:
+        docs[429]["headers"] = {
+            "Retry-After": header_doc("Seconds to wait before calling again", "integer"),
+            **RATE_LIMIT_HEADERS,
+        }
+    return docs
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +309,8 @@ def limit_availability_calls(request: Request, response: Response) -> None:
     response.headers["X-RateLimit-Remaining"] = str(remaining)
 
 
-@app.get("/availability", response_model=Availability, responses=errors(422, 429),
+@app.get("/availability", response_model=Availability,
+         responses={200: {"headers": RATE_LIMIT_HEADERS}, **errors(422, 429)},
          dependencies=[Depends(limit_availability_calls)], tags=["rooms"])
 def availability(
     slot: str = Query(description="Slot start time, e.g. 09:00"),
@@ -296,8 +324,15 @@ def availability(
     return booking_core.availability(slot, group_size)
 
 
-@app.post("/bookings", status_code=201, response_model=Booking,
-          responses=errors(400, 409, 422), tags=["bookings"])
+@app.post("/bookings", status_code=201, response_model=Booking, tags=["bookings"],
+          responses={
+              201: {"description": "Booking created, or replayed for a repeated Idempotency-Key",
+                    "headers": {
+                        "Location": header_doc("URL of the booking, e.g. /bookings/{id}"),
+                        "Idempotent-Replayed": header_doc("'true' when this is a replay of an earlier request"),
+                    }},
+              **errors(400, 409, 422),
+          })
 def create_booking(
     req: BookingRequest,
     response: Response,
@@ -366,7 +401,22 @@ def cancel_booking(booking_id: uuid.UUID):
     return Response(status_code=204)
 
 
-@app.get("/metrics", tags=["service"])
+@app.get("/redoc", include_in_schema=False)
+def redoc():
+    """API reference page drawn from the OpenAPI spec.
+
+    FastAPI 0.109 loads ReDoc from the CDN tag "redoc@next", which no longer
+    renders (blank page), so we point it at the stable 2.x release instead.
+    """
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title="StudySlot - ReDoc",
+        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
+    )
+
+
+@app.get("/metrics", response_class=PlainTextResponse, tags=["service"],
+         responses={200: {"description": "Prometheus text exposition format"}})
 def metrics():
     """The page Prometheus scrapes. Plain text, not JSON."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

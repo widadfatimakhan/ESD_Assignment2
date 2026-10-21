@@ -31,6 +31,8 @@ docker compose ps
 | http://localhost:9090/targets | Prometheus scrape targets (should be UP) |
 | http://localhost:3000 | Grafana dashboards (login admin / admin) → dashboard "StudySlot Overview" |
 | http://localhost:5601/app/discover | Kibana — search logs (data view `studyslot-logs-*`) |
+| http://localhost:8000/redoc | API reference (ReDoc), generated from the OpenAPI spec |
+| `openapi.json` | Exported OpenAPI 3.1 spec. Regenerate: `python scripts/export_openapi.py` |
 
 Make a booking: on `/docs`, `POST /bookings` with e.g.
 `{ "room": "R3", "slot": "09:00", "student_ids": ["s1","s2","s3","s4","s5"] }`.
