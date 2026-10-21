@@ -10,7 +10,7 @@ import uuid
 from http import HTTPStatus
 from typing import Annotated
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -257,15 +257,32 @@ def availability(
 
 @app.post("/bookings", status_code=201, response_model=Booking,
           responses=errors(400, 409, 422), tags=["bookings"])
-def create_booking(req: BookingRequest, response: Response):
-    """Book a room for a slot. Returns 201 with a Location header pointing at the new booking."""
+def create_booking(
+    req: BookingRequest,
+    response: Response,
+    idempotency_key: str | None = Header(
+        None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Optional but recommended. A unique value (e.g. a UUID) chosen by the client for "
+            "this booking. Retrying with the same key and body returns the original booking "
+            "instead of creating a new one or failing with 409."
+        ),
+    ),
+):
+    """Book a room for a slot. Returns 201 with a Location header pointing at the new booking.
+
+    A replayed request (same Idempotency-Key, same body) returns the original 201
+    response with the header `Idempotent-Replayed: true`.
+    """
     if CARDINALITY_BOMB_ON:
         CARDINALITY_DEMO.labels(request_id=request_id_var.get()).inc()
 
     start = time.perf_counter()        # stopwatch for the availability check
     time.sleep(INJECTED_DELAY)         # chaos: 0 normally; >0 when delay is injected
     try:
-        booking = booking_core.create_booking(req.room, req.slot, req.student_ids)
+        booking, replayed = booking_core.create_booking(
+            req.room, req.slot, req.student_ids, idempotency_key=idempotency_key
+        )
     except booking_core.BookingError as err:
         log_event("booking rejected", level="WARNING", room=req.room, slot=req.slot,
                   group_size=len(req.student_ids), status=status_for(err), reason=err.reason)
@@ -275,10 +292,15 @@ def create_booking(req: BookingRequest, response: Response):
         AVAILABILITY_CHECK_SECONDS.observe(elapsed)
         AVAILABILITY_CHECK_SUMMARY.observe(elapsed)
 
-    BOOKINGS_TOTAL.inc()
-    log_event("booking confirmed", level="INFO", booking_id=booking["id"], room=booking["room"],
-              slot=booking["slot"], group_size=booking["group_size"], status=201)
     response.headers["Location"] = f"/bookings/{booking['id']}"
+    if replayed:
+        response.headers["Idempotent-Replayed"] = "true"
+        log_event("booking replayed", level="INFO", booking_id=booking["id"], room=booking["room"],
+                  slot=booking["slot"], status=201, idempotent_replay=True)
+    else:
+        BOOKINGS_TOTAL.inc()           # count only bookings that were really created
+        log_event("booking confirmed", level="INFO", booking_id=booking["id"], room=booking["room"],
+                  slot=booking["slot"], group_size=booking["group_size"], status=201)
     return booking
 
 

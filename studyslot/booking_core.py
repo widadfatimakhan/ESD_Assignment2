@@ -5,6 +5,8 @@ Part B, so the rules can never drift apart. Nothing here knows about HTTP or
 gRPC: when a rule is broken it raises a BookingError, and each API decides
 which status code that becomes.
 """
+import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -70,6 +72,10 @@ class BookingNotFound(BookingError):
     reason = "not_found"
 
 
+class IdempotencyKeyReused(BookingError):
+    reason = "idempotency_key_reused"
+
+
 # --- Helpers ---
 def _fits(room: str, group_size: int) -> bool:
     info = ROOMS[room]
@@ -124,8 +130,20 @@ def availability(slot: str, group_size: int | None = None) -> dict:
     }
 
 
-def create_booking(room: str, slot: str, student_ids: list[str]) -> dict:
-    """Book a room for a slot. Enforces size limits and no double-booking."""
+def request_fingerprint(room: str, slot: str, student_ids: list[str]) -> str:
+    """A short hash of the request body, used to spot a key reused for a different request."""
+    body = json.dumps({"room": room, "slot": slot, "student_ids": list(student_ids)}, sort_keys=True)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def create_booking(room: str, slot: str, student_ids: list[str],
+                   idempotency_key: str | None = None) -> tuple[dict, bool]:
+    """Book a room for a slot. Enforces size limits and no double-booking.
+
+    Returns (booking, replayed). If the same idempotency_key was already used
+    for the same request, nothing new is created: the original booking comes
+    back with replayed=True. That makes it safe for a client to retry.
+    """
     if room not in ROOMS:
         raise UnknownRoom(f"Unknown room '{room}'")
     if slot not in SLOTS:
@@ -159,10 +177,19 @@ def create_booking(room: str, slot: str, student_ids: list[str]) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        db.insert_booking(booking)      # the UNIQUE(room, slot) rule makes this atomic
+        saved, replayed = db.insert_booking(
+            booking,
+            idempotency_key=idempotency_key,
+            request_hash=request_fingerprint(room, slot, student_ids),
+        )
     except db.DuplicateBooking:
         raise AlreadyBooked(f"Room {room} is already booked for {slot}.") from None
-    return _with_group_size(booking)
+    except db.IdempotencyKeyConflict:
+        raise IdempotencyKeyReused(
+            "This Idempotency-Key was already used with a different request body. "
+            "Use a new key for a new booking."
+        ) from None
+    return _with_group_size(saved), replayed
 
 
 def list_bookings() -> list[dict]:
