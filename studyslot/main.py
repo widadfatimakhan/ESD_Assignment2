@@ -10,7 +10,7 @@ import uuid
 from http import HTTPStatus
 from typing import Annotated
 
-from fastapi import FastAPI, Header, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import booking_core
 import db
 from logging_setup import log_event, request_id_var
+from rate_limit import RateLimitExceeded, SlidingWindowRateLimiter
 
 db.init_db()   # create the database file and table on startup if needed
 
@@ -153,6 +154,22 @@ async def handle_http_error(request: Request, exc: StarletteHTTPException):
     return error_response(request, exc.status_code, code, str(exc.detail), headers=exc.headers)
 
 
+@app.exception_handler(RateLimitExceeded)
+async def handle_rate_limited(request: Request, exc: RateLimitExceeded):
+    log_event("rate limited", level="WARNING", method=request.method, path=request.url.path,
+              client=exc.client, status=429, retry_after_seconds=exc.retry_after)
+    return error_response(
+        request, 429, "rate_limited",
+        f"Too many requests: at most {exc.limit} calls per {exc.window_seconds} seconds "
+        f"per client. Try again in {exc.retry_after} seconds.",
+        details={"limit": exc.limit, "window_seconds": exc.window_seconds,
+                 "retry_after_seconds": exc.retry_after, "client": exc.client},
+        headers={"Retry-After": str(exc.retry_after),
+                 "X-RateLimit-Limit": str(exc.limit),
+                 "X-RateLimit-Remaining": "0"},
+    )
+
+
 @app.exception_handler(Exception)
 async def handle_unexpected_error(request: Request, exc: Exception):
     log_event("unhandled error", level="ERROR", path=request.url.path, error=repr(exc))
@@ -246,12 +263,36 @@ def list_rooms():
     return booking_core.list_rooms()
 
 
-@app.get("/availability", response_model=Availability, responses=errors(422), tags=["rooms"])
+# ---------------------------------------------------------------------------
+# Rate limiting for GET /availability
+# Students refresh availability to hunt for a free room, so this is the
+# endpoint most likely to be hammered. Each client (identified by its IP
+# address) gets 5 calls in any 10-second period.
+# ---------------------------------------------------------------------------
+AVAILABILITY_LIMIT = 5
+AVAILABILITY_WINDOW_SECONDS = 10
+availability_limiter = SlidingWindowRateLimiter(AVAILABILITY_LIMIT, AVAILABILITY_WINDOW_SECONDS)
+
+
+def limit_availability_calls(request: Request, response: Response) -> None:
+    """Dependency: runs before /availability. Raises RateLimitExceeded when over the limit."""
+    client = request.client.host if request.client else "unknown"
+    remaining = availability_limiter.check(client)
+    response.headers["X-RateLimit-Limit"] = str(AVAILABILITY_LIMIT)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+
+
+@app.get("/availability", response_model=Availability, responses=errors(422, 429),
+         dependencies=[Depends(limit_availability_calls)], tags=["rooms"])
 def availability(
     slot: str = Query(description="Slot start time, e.g. 09:00"),
     group_size: int | None = Query(None, ge=1, le=50, description="Only show rooms that fit this many students"),
 ):
-    """Free rooms for a slot. Pass group_size to see only rooms that fit."""
+    """Free rooms for a slot. Pass group_size to see only rooms that fit.
+
+    Rate limited: 5 calls per 10 seconds per client IP. Over the limit you get
+    429 with a Retry-After header saying how many seconds to wait.
+    """
     return booking_core.availability(slot, group_size)
 
 
