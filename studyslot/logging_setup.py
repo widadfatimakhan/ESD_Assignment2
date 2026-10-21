@@ -8,9 +8,15 @@ import json
 import logging
 import os
 import sys
+from contextvars import ContextVar
 from datetime import datetime, timezone
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "studyslot")
+
+# The ID of the request currently being handled. The HTTP middleware in main.py
+# sets it (and the gRPC server will in Part B); log_event() adds it to every
+# log line automatically, so all lines from one request can be found together.
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 _logger = logging.getLogger(SERVICE_NAME)
 _logger.setLevel(logging.INFO)
@@ -35,7 +41,10 @@ def log_event(message: str, *, level: str = "INFO", **fields) -> None:
         "service": {"name": SERVICE_NAME},
         "log": {"level": level.lower()},
         "message": message,
-        **fields,
     }
+    request_id = request_id_var.get()
+    if request_id:
+        record["request_id"] = request_id
+    record.update(fields)
     line = json.dumps(record, separators=(",", ":"))
     getattr(_logger, level.lower(), _logger.info)(line)

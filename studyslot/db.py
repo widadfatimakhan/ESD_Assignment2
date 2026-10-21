@@ -57,22 +57,33 @@ def booked_rooms(slot: str) -> set[str]:
     return {row["room"] for row in rows}
 
 
+def _row_to_booking(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "room": row["room"],
+        "slot": row["slot"],
+        "student_ids": json.loads(row["student_ids"]),
+        "created_at": row["created_at"],
+    }
+
+
 def all_bookings() -> list[dict]:
     """Every booking, sorted by room then slot."""
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, room, slot, student_ids, created_at FROM bookings ORDER BY room, slot"
         ).fetchall()
-    return [
-        {
-            "id": row["id"],
-            "room": row["room"],
-            "slot": row["slot"],
-            "student_ids": json.loads(row["student_ids"]),
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    return [_row_to_booking(row) for row in rows]
+
+
+def get_booking(booking_id: str) -> dict | None:
+    """One booking by its ID, or None if it doesn't exist."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, room, slot, student_ids, created_at FROM bookings WHERE id = ?",
+            (booking_id,),
+        ).fetchone()
+    return _row_to_booking(row) if row else None
 
 
 def insert_booking(booking: dict) -> None:
@@ -93,10 +104,10 @@ def insert_booking(booking: dict) -> None:
         raise DuplicateBooking from exc
 
 
-def delete_booking(room: str, slot: str) -> bool:
-    """Delete the booking for room+slot. Returns True if one was deleted."""
+def delete_booking(booking_id: str) -> bool:
+    """Delete a booking by its ID. Returns True if one was deleted."""
     with connect() as conn:
-        cursor = conn.execute("DELETE FROM bookings WHERE room = ? AND slot = ?", (room, slot))
+        cursor = conn.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
     return cursor.rowcount > 0
 
 

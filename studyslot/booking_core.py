@@ -50,6 +50,10 @@ class NoStudents(BookingError):
     reason = "no_student_ids"
 
 
+class InvalidStudentIds(BookingError):
+    reason = "invalid_student_ids"
+
+
 class GroupTooLarge(BookingError):
     reason = "group_too_large"
 
@@ -70,6 +74,11 @@ class BookingNotFound(BookingError):
 def _fits(room: str, group_size: int) -> bool:
     info = ROOMS[room]
     return info["min_group"] <= group_size <= info["capacity"]
+
+
+def _with_group_size(booking: dict) -> dict:
+    """Add the derived group_size field to a stored booking."""
+    return {**booking, "group_size": len(booking["student_ids"])}
 
 
 def rooms_that_fit(group_size: int, slot: str) -> list[str]:
@@ -123,6 +132,11 @@ def create_booking(room: str, slot: str, student_ids: list[str]) -> dict:
         raise UnknownSlot(f"Unknown slot '{slot}'")
     if not student_ids:
         raise NoStudents("At least one student ID is required")
+    if any(not sid.strip() for sid in student_ids):
+        raise InvalidStudentIds("Student IDs cannot be blank")
+    duplicates = sorted({sid for sid in student_ids if student_ids.count(sid) > 1})
+    if duplicates:
+        raise InvalidStudentIds("Each student can only be listed once", duplicates=duplicates)
 
     info = ROOMS[room]
     group_size = len(student_ids)
@@ -148,18 +162,25 @@ def create_booking(room: str, slot: str, student_ids: list[str]) -> dict:
         db.insert_booking(booking)      # the UNIQUE(room, slot) rule makes this atomic
     except db.DuplicateBooking:
         raise AlreadyBooked(f"Room {room} is already booked for {slot}.") from None
-    return booking
+    return _with_group_size(booking)
 
 
 def list_bookings() -> list[dict]:
     """Librarian view: everything currently booked."""
-    return [
-        {"id": b["id"], "room": b["room"], "slot": b["slot"], "student_ids": b["student_ids"]}
-        for b in db.all_bookings()
-    ]
+    return [_with_group_size(b) for b in db.all_bookings()]
 
 
-def cancel_booking(room: str, slot: str) -> None:
-    """Cancel the booking for room+slot."""
-    if not db.delete_booking(room, slot):
-        raise BookingNotFound("No such booking")
+def get_booking(booking_id: str) -> dict:
+    """One booking by its ID."""
+    booking = db.get_booking(booking_id)
+    if booking is None:
+        raise BookingNotFound(f"No booking with id '{booking_id}'")
+    return _with_group_size(booking)
+
+
+def cancel_booking(booking_id: str) -> dict:
+    """Cancel a booking by its ID and return what was cancelled."""
+    booking = get_booking(booking_id)          # raises BookingNotFound
+    if not db.delete_booking(booking_id):      # someone else cancelled it a moment ago
+        raise BookingNotFound(f"No booking with id '{booking_id}'")
+    return booking

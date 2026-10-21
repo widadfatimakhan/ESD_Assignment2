@@ -1,29 +1,40 @@
 """StudySlot HTTP API (FastAPI).
 
-This file only deals with HTTP: routes, status codes, metrics and chaos
-switches. The booking rules live in booking_core.py and the data in db.py,
-so the gRPC service (Part B) can reuse exactly the same rules and data.
+This file only deals with HTTP: routes, status codes, the error format,
+metrics and chaos switches. The booking rules live in booking_core.py and the
+data in db.py, so the gRPC service (Part B) reuses exactly the same rules and data.
 """
+import re
 import time
 import uuid
+from http import HTTPStatus
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
-from pydantic import BaseModel
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import (
     Counter, Gauge, Histogram, Summary,
     generate_latest, CONTENT_TYPE_LATEST,
 )
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import booking_core
 import db
-from logging_setup import log_event
+from logging_setup import log_event, request_id_var
 
 db.init_db()   # create the database file and table on startup if needed
 
-app = FastAPI(title="StudySlot")
+app = FastAPI(
+    title="StudySlot",
+    version="2.0.0",
+    description="Campus study-room booking service (ESD Assignment 2).",
+)
 
-# --- Metrics ---
+# ---------------------------------------------------------------------------
+# Metrics (same as A1)
+# ---------------------------------------------------------------------------
 # DELIBERATELY BAD metric for the A1 cardinality experiment: a per-request-ID label.
 CARDINALITY_DEMO = Counter(
     "studyslot_requests_by_id_total",
@@ -32,15 +43,13 @@ CARDINALITY_DEMO = Counter(
 )
 CARDINALITY_BOMB_ON = False
 
-# Counter: successful bookings made through this HTTP API.
 BOOKINGS_TOTAL = Counter(
     "studyslot_bookings_total",
     "Total number of successful room bookings",
 )
 
-# Gauge: room-slots booked right now. Instead of adding/subtracting in memory,
-# it reads the count from the database every time Prometheus scrapes, so it
-# stays correct after restarts and when the gRPC service changes bookings too.
+# Reads the count from the database at every scrape, so it stays correct after
+# restarts and when the gRPC service changes bookings too.
 ROOMS_OCCUPIED = Gauge(
     "studyslot_rooms_occupied",
     "Number of room-slots currently booked",
@@ -60,134 +69,270 @@ AVAILABILITY_CHECK_SUMMARY = Summary(
     "Summary of availability-check duration (average via _sum / _count)",
 )
 
-# --- Turning booking rule errors into HTTP responses ---
-# Which HTTP status each kind of problem becomes. Anything not listed is 400.
+
+# ---------------------------------------------------------------------------
+# Request IDs: every request gets one, sent back in the X-Request-ID header,
+# included in every log line and in every error body.
+# ---------------------------------------------------------------------------
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+@app.middleware("http")
+async def assign_request_id(request: Request, call_next):
+    incoming = request.headers.get("X-Request-ID", "")
+    # Reuse the caller's ID if it looks safe, otherwise make a new one.
+    request_id = incoming if _SAFE_REQUEST_ID.match(incoming) else uuid.uuid4().hex[:16]
+    request.state.request_id = request_id
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# ---------------------------------------------------------------------------
+# One error format for every error response:
+#   {"error": {"code": "...", "message": "...", "request_id": "...", "details": {...}}}
+# ---------------------------------------------------------------------------
+class ErrorBody(BaseModel):
+    code: str = Field(description="Short machine-readable error code", examples=["double_booked"])
+    message: str = Field(description="Human-readable explanation")
+    request_id: str | None = Field(None, description="Matches the X-Request-ID header and the logs")
+    details: dict | None = Field(None, description="Extra information, when there is any")
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorBody
+
+
+def error_response(request: Request, status: int, code: str, message: str,
+                   details: dict | None = None, headers: dict | None = None) -> JSONResponse:
+    body = {"code": code, "message": message,
+            "request_id": getattr(request.state, "request_id", None)}
+    if details:
+        body["details"] = details
+    return JSONResponse(status_code=status, content={"error": body}, headers=headers)
+
+
+# Which HTTP status each kind of booking-rule problem becomes.
+# Anything not listed is 422: the request was readable but broke a rule.
 HTTP_STATUS_FOR = {
     booking_core.AlreadyBooked: 409,
     booking_core.BookingNotFound: 404,
 }
 
 
-def http_error(err: booking_core.BookingError) -> HTTPException:
-    status = HTTP_STATUS_FOR.get(type(err), 400)
-    return HTTPException(
-        status_code=status,
-        detail={"reason": err.reason, "message": err.message, **err.details},
-    )
+def status_for(err: booking_core.BookingError) -> int:
+    return HTTP_STATUS_FOR.get(type(err), 422)
+
+
+@app.exception_handler(booking_core.BookingError)
+async def handle_booking_error(request: Request, err: booking_core.BookingError):
+    return error_response(request, status_for(err), err.reason, err.message, err.details)
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    if any(e["type"] == "json_invalid" for e in errors):
+        status, code, message, details = 400, "malformed_json", "The request body is not valid JSON.", None
+    else:
+        problems = [{"field": ".".join(str(p) for p in e["loc"]), "problem": e["msg"]} for e in errors]
+        status, code, message, details = 422, "validation_error", "Some fields are missing or invalid.", {"problems": problems}
+    log_event("request rejected", level="WARNING", method=request.method,
+              path=request.url.path, status=status, reason=code)
+    return error_response(request, status, code, message, details)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def handle_http_error(request: Request, exc: StarletteHTTPException):
+    # e.g. 404 for an unknown path, 405 for a wrong method
+    code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
+    return error_response(request, exc.status_code, code, str(exc.detail), headers=exc.headers)
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception):
+    log_event("unhandled error", level="ERROR", path=request.url.path, error=repr(exc))
+    return error_response(request, 500, "internal_error", "Something went wrong on our side.")
+
+
+def errors(*codes: int) -> dict:
+    """OpenAPI helper: document that these status codes return ErrorResponse."""
+    descriptions = {400: "Malformed request", 404: "Not found", 409: "Conflict",
+                    422: "Invalid input or broken booking rule", 429: "Too many requests"}
+    return {c: {"model": ErrorResponse, "description": descriptions.get(c, "Error")} for c in codes}
+
+
+# ---------------------------------------------------------------------------
+# Request and response shapes
+# ---------------------------------------------------------------------------
+StudentId = Annotated[str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
 class BookingRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",   # unknown fields are rejected instead of silently ignored
+        json_schema_extra={"examples": [
+            {"room": "R3", "slot": "09:00", "student_ids": ["s1", "s2", "s3", "s4", "s5"]}
+        ]},
+    )
+    room: str = Field(description="Room code, R1 to R5")
+    slot: str = Field(description="Start time of a 30-minute slot, 09:00 to 16:30")
+    student_ids: list[StudentId] = Field(min_length=1, max_length=50,
+                                         description="Every student in the group, each listed once")
+
+
+class Booking(BaseModel):
+    id: str
     room: str
     slot: str
     student_ids: list[str]
+    group_size: int
+    created_at: str
 
 
-# --- Routes ---
-@app.get("/")
+class RoomInfo(BaseModel):
+    room: str
+    capacity: int
+    min_group: int
+    booked_slots: list[str]
+    free_slot_count: int
+
+
+class FreeRoom(BaseModel):
+    room: str
+    capacity: int
+    min_group: int
+
+
+class Availability(BaseModel):
+    slot: str
+    group_size: int | None
+    free_rooms: list[FreeRoom]
+
+
+class DelaySetting(BaseModel):
+    seconds: float = Field(ge=0, le=10, description="Delay added to each booking's availability check; 0 turns it off")
+
+
+class CardinalitySetting(BaseModel):
+    active: bool
+
+
+class ChaosState(BaseModel):
+    delay_seconds: float
+    cardinality_bomb: bool
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/", tags=["service"])
 def home():
     return {"service": "StudySlot", "status": "running"}
 
 
-@app.get("/health")
+@app.get("/health", tags=["service"])
 def health():
     return {"status": "ok"}
 
 
-@app.get("/rooms")
+@app.get("/rooms", response_model=list[RoomInfo], tags=["rooms"])
 def list_rooms():
-    """Every room with its size limits and how many slots are free."""
+    """Every room with its size limits and which slots are booked."""
     return booking_core.list_rooms()
 
 
-@app.get("/availability")
-def availability(slot: str, group_size: int | None = None):
+@app.get("/availability", response_model=Availability, responses=errors(422), tags=["rooms"])
+def availability(
+    slot: str = Query(description="Slot start time, e.g. 09:00"),
+    group_size: int | None = Query(None, ge=1, le=50, description="Only show rooms that fit this many students"),
+):
     """Free rooms for a slot. Pass group_size to see only rooms that fit."""
-    try:
-        return booking_core.availability(slot, group_size)
-    except booking_core.BookingError as err:
-        raise http_error(err)
+    return booking_core.availability(slot, group_size)
 
 
-@app.post("/book")
-def book(req: BookingRequest):
-    """Book a room for a slot for a group. Enforces size limits and no double-booking."""
-    request_id = uuid.uuid4().hex[:8]   # short unique ID for this request, e.g. "a3f9c1d2"
+@app.post("/bookings", status_code=201, response_model=Booking,
+          responses=errors(400, 409, 422), tags=["bookings"])
+def create_booking(req: BookingRequest, response: Response):
+    """Book a room for a slot. Returns 201 with a Location header pointing at the new booking."""
     if CARDINALITY_BOMB_ON:
-        CARDINALITY_DEMO.labels(request_id=request_id).inc()
+        CARDINALITY_DEMO.labels(request_id=request_id_var.get()).inc()
 
     start = time.perf_counter()        # stopwatch for the availability check
     time.sleep(INJECTED_DELAY)         # chaos: 0 normally; >0 when delay is injected
     try:
         booking = booking_core.create_booking(req.room, req.slot, req.student_ids)
     except booking_core.BookingError as err:
-        error = http_error(err)
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  group_size=len(req.student_ids), status=error.status_code,
-                  reason=err.reason)
-        raise error
+        log_event("booking rejected", level="WARNING", room=req.room, slot=req.slot,
+                  group_size=len(req.student_ids), status=status_for(err), reason=err.reason)
+        raise                          # handle_booking_error turns it into the error response
     finally:
         elapsed = time.perf_counter() - start
         AVAILABILITY_CHECK_SECONDS.observe(elapsed)
         AVAILABILITY_CHECK_SUMMARY.observe(elapsed)
 
     BOOKINGS_TOTAL.inc()
-    log_event("booking confirmed", level="INFO",
-              request_id=request_id, booking_id=booking["id"],
-              room=req.room, slot=req.slot,
-              group_size=len(req.student_ids), status=200)
-    return {
-        "message": "Booked",
-        "booking_id": booking["id"],
-        "room": booking["room"],
-        "slot": booking["slot"],
-        "group_size": len(booking["student_ids"]),
-    }
+    log_event("booking confirmed", level="INFO", booking_id=booking["id"], room=booking["room"],
+              slot=booking["slot"], group_size=booking["group_size"], status=201)
+    response.headers["Location"] = f"/bookings/{booking['id']}"
+    return booking
 
 
-@app.get("/bookings")
+@app.get("/bookings", response_model=list[Booking], tags=["bookings"])
 def list_bookings():
     """Librarian view: everything currently booked."""
     return booking_core.list_bookings()
 
 
-@app.delete("/bookings/{room}/{slot}")
-def cancel(room: str, slot: str):
-    """Cancel a booking, freeing that room+slot."""
-    try:
-        booking_core.cancel_booking(room, slot)
-    except booking_core.BookingError as err:
-        raise http_error(err)
-    log_event("booking cancelled", level="INFO", room=room, slot=slot, status=200)
-    return {"message": "Cancelled", "room": room, "slot": slot}
+@app.get("/bookings/{booking_id}", response_model=Booking, responses=errors(404, 422), tags=["bookings"])
+def get_booking(booking_id: uuid.UUID):
+    """One booking by its ID."""
+    return booking_core.get_booking(str(booking_id))
 
 
-@app.get("/metrics")
+@app.delete("/bookings/{booking_id}", status_code=204, responses=errors(404, 422), tags=["bookings"])
+def cancel_booking(booking_id: uuid.UUID):
+    """Cancel a booking. Returns 204 with no body."""
+    booking = booking_core.cancel_booking(str(booking_id))
+    log_event("booking cancelled", level="INFO", booking_id=booking["id"],
+              room=booking["room"], slot=booking["slot"], status=204)
+    return Response(status_code=204)
+
+
+@app.get("/metrics", tags=["service"])
 def metrics():
     """The page Prometheus scrapes. Plain text, not JSON."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # --- Chaos switches (from A1) ---
-@app.post("/chaos/delay")
-def set_delay(seconds: float = 0.0):
-    """Turn the artificial availability-check delay on/off. seconds=0 disables it."""
+def chaos_state() -> dict:
+    return {"delay_seconds": INJECTED_DELAY, "cardinality_bomb": CARDINALITY_BOMB_ON}
+
+
+@app.get("/chaos", response_model=ChaosState, tags=["chaos"])
+def get_chaos():
+    """Current chaos settings."""
+    return chaos_state()
+
+
+@app.put("/chaos/delay", response_model=ChaosState, responses=errors(422), tags=["chaos"])
+def set_delay(setting: DelaySetting):
+    """Set the artificial availability-check delay. 0 turns it off."""
     global INJECTED_DELAY
-    INJECTED_DELAY = seconds
-    log_event("chaos delay set", level="WARNING", injected_delay_seconds=seconds)
-    return {"injected_delay_seconds": INJECTED_DELAY}
+    INJECTED_DELAY = setting.seconds
+    log_event("chaos delay set", level="WARNING", injected_delay_seconds=setting.seconds)
+    return chaos_state()
 
 
-@app.get("/chaos/status")
-def chaos_status():
-    """Show current chaos state."""
-    return {"injected_delay_seconds": INJECTED_DELAY}
-
-
-@app.post("/chaos/cardinality")
-def set_cardinality(active: bool = False):
-    """Arm/disarm the cardinality bomb (per-request_id metric label)."""
+@app.put("/chaos/cardinality", response_model=ChaosState, responses=errors(422), tags=["chaos"])
+def set_cardinality(setting: CardinalitySetting):
+    """Arm or disarm the cardinality bomb (per-request_id metric label)."""
     global CARDINALITY_BOMB_ON
-    CARDINALITY_BOMB_ON = active
-    log_event("chaos cardinality set", level="WARNING", cardinality_bomb=active)
-    return {"cardinality_bomb": CARDINALITY_BOMB_ON}
+    CARDINALITY_BOMB_ON = setting.active
+    log_event("chaos cardinality set", level="WARNING", cardinality_bomb=setting.active)
+    return chaos_state()

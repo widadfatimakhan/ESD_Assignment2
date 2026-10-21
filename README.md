@@ -32,17 +32,19 @@ docker compose ps
 | http://localhost:3000 | Grafana dashboards (login admin / admin) → dashboard "StudySlot Overview" |
 | http://localhost:5601/app/discover | Kibana — search logs (data view `studyslot-logs-*`) |
 
-Make a booking: on `/docs`, `POST /book` with e.g.
+Make a booking: on `/docs`, `POST /bookings` with e.g.
 `{ "room": "R3", "slot": "09:00", "student_ids": ["s1","s2","s3","s4","s5"] }`.
+It returns `201 Created` with the booking (including its `id`) and a `Location`
+header. Cancel it with `DELETE /bookings/{id}`.
 
 ## Test / reproduce the experiments
-- **Injected latency (Part E1):** `POST /chaos/delay?seconds=0.5`, make some
-  bookings, watch Grafana's p95 panel spike; `POST /chaos/delay?seconds=0` to
-  recover.
-- **Cardinality (Part E2):** `POST /chaos/cardinality?active=true`, make ~15–20
-  requests, run `count(studyslot_requests_by_id_total)` in Prometheus and watch
-  series grow; `POST /chaos/cardinality?active=false` to stop.
-- Check current chaos state: `GET /chaos/status`.
+- **Injected latency (A1 Part E1):** `PUT /chaos/delay` with `{"seconds": 0.5}`,
+  make some bookings, watch Grafana's p95 panel spike; `PUT /chaos/delay` with
+  `{"seconds": 0}` to recover.
+- **Cardinality (A1 Part E2):** `PUT /chaos/cardinality` with `{"active": true}`,
+  make ~15–20 bookings, run `count(studyslot_requests_by_id_total)` in Prometheus
+  and watch series grow; `PUT /chaos/cardinality` with `{"active": false}` to stop.
+- Check current chaos state: `GET /chaos`.
 
 ## Stop and clean up
 - Pause (keeps data): `docker compose stop`
