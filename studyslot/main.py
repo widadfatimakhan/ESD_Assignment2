@@ -1,302 +1,497 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
-from pydantic import BaseModel
+"""StudySlot HTTP API (FastAPI).
+
+This file only deals with HTTP: routes, status codes, the error format,
+metrics and chaos switches. The booking rules live in booking_core.py and the
+data in db.py, so the gRPC service (Part B) reuses exactly the same rules and data.
+"""
+import re
+import threading
+import time
+import uuid
+from http import HTTPStatus
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.docs import get_redoc_html
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import (
     Counter, Gauge, Histogram, Summary,
     generate_latest, CONTENT_TYPE_LATEST,
 )
-import time
-import json
-import logging
-import sys
-import uuid
-from datetime import datetime, timezone
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-SERVICE_NAME = "studyslot"
+import booking_core
+import db
+from logging_setup import log_event, request_id_var
+from rate_limit import RateLimitExceeded, SlidingWindowRateLimiter
 
-import os
+db.init_db()   # create the database file and table on startup if needed
 
-_logger = logging.getLogger(SERVICE_NAME)
-_logger.setLevel(logging.INFO)
-_logger.propagate = False
-if not _logger.handlers:
-    # 1) Keep printing to the screen (handy while developing).
-    _stream_handler = logging.StreamHandler(sys.stdout)
-    _stream_handler.setFormatter(logging.Formatter("%(message)s"))
-    _logger.addHandler(_stream_handler)
+app = FastAPI(
+    title="StudySlot",
+    version="2.0.0",
+    description=(
+        "Campus study-room booking service (ESD Assignment 2).\n\n"
+        "- Every response carries an `X-Request-ID` header. Send your own to correlate calls; "
+        "otherwise one is generated. The same ID appears in the logs and in error bodies.\n"
+        "- Every error uses the `ErrorResponse` shape: `{\"error\": {\"code\", \"message\", "
+        "\"request_id\", \"details\"}}`.\n"
+        "- `POST /bookings` accepts an `Idempotency-Key` header so retries are safe.\n"
+        "- `GET /availability` is rate limited to 5 calls per 10 seconds per client IP."
+    ),
+    redoc_url=None,   # replaced by the /redoc route below (FastAPI's default ReDoc link is broken)
+)
 
-    # 2) ALSO write each line to a file that Filebeat will read.
-    os.makedirs("logs", exist_ok=True)                 # create logs/ if missing
-    _file_handler = logging.FileHandler("logs/app.log", encoding="utf-8")
-    _file_handler.setFormatter(logging.Formatter("%(message)s"))
-    _logger.addHandler(_file_handler)
-
-
-def log_event(message: str, *, level: str = "INFO", **fields) -> None:
-    """Write ONE line of JSON with a timestamp, service name, level, message, and extra fields."""
-    record = {
-        "@timestamp": datetime.now(timezone.utc).isoformat(),
-        "service": {"name": SERVICE_NAME},
-        "log": {"level": level.lower()},
-        "message": message,
-        **fields,
-    }
-    line = json.dumps(record, separators=(",", ":"))
-    getattr(_logger, level.lower(), _logger.info)(line)
-
-app = FastAPI(title="StudySlot")
-# --- Metrics ---
-# DELIBERATELY BAD metric for the cardinality experiment: a per-request-ID label.
-# Each unique request_id creates a NEW time series -> cardinality explosion.
+# ---------------------------------------------------------------------------
+# Metrics (same as A1)
+# ---------------------------------------------------------------------------
+# DELIBERATELY BAD metric for the A1 cardinality experiment: a per-request-ID label.
 CARDINALITY_DEMO = Counter(
     "studyslot_requests_by_id_total",
     "UNSAFE demo: one series per unique request_id",
     ["request_id"],
 )
-
-# Toggle so we only explode cardinality when we choose to.
 CARDINALITY_BOMB_ON = False
 
-# A Counter only ever goes up. This one counts successful bookings.
 BOOKINGS_TOTAL = Counter(
     "studyslot_bookings_total",
     "Total number of successful room bookings",
 )
-# A Gauge goes up AND down. Rooms occupied right now.
+
+# Reads the count from the database at every scrape, so it stays correct after
+# restarts and when the gRPC service changes bookings too.
 ROOMS_OCCUPIED = Gauge(
     "studyslot_rooms_occupied",
     "Number of room-slots currently booked",
 )
+ROOMS_OCCUPIED.set_function(db.count_bookings)
+
 # Chaos: artificial delay (seconds) injected into the availability check. 0 = off.
 INJECTED_DELAY = 0.0
 
-# A Histogram times an operation and sorts each timing into buckets.
-# Buckets are in seconds; these match the ranges the assignment mentions.
+# Chaos: the next N POST /bookings requests fail with 503, as if the service
+# were briefly down. Used to demonstrate the caller's retries and circuit breaker.
+FAIL_NEXT_BOOKINGS = 0
+_chaos_lock = threading.Lock()
+
+
+class InjectedFailure(Exception):
+    """Simulated outage: main.py turns this into 503 Service Unavailable."""
+
+
+def consume_injected_failure() -> bool:
+    """True if this request should fail (and counts it down)."""
+    global FAIL_NEXT_BOOKINGS
+    with _chaos_lock:
+        if FAIL_NEXT_BOOKINGS > 0:
+            FAIL_NEXT_BOOKINGS -= 1
+            return True
+    return False
+
 AVAILABILITY_CHECK_SECONDS = Histogram(
     "studyslot_availability_check_seconds",
     "Time spent checking room availability during a booking",
     buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
 )
-
-# A Summary also times an operation, but reports a running average
-# (Python summaries don't do percentiles — the histogram covers those).
 AVAILABILITY_CHECK_SUMMARY = Summary(
     "studyslot_availability_check_summary_seconds",
     "Summary of availability-check duration (average via _sum / _count)",
 )
 
-# --- Rooms, each with a capacity and a minimum group size ---
-# capacity  = the most students the room fits
-# min_group = the fewest students allowed to book it (stops a big room
-#             being hogged by one or two people)
-ROOMS = {
-    "R1": {"capacity": 20, "min_group": 10},
-    "R2": {"capacity": 12, "min_group": 6},
-    "R3": {"capacity": 10,  "min_group": 5},
-    "R4": {"capacity": 8,  "min_group": 3},
-    "R5": {"capacity": 8,  "min_group": 3},
+
+# ---------------------------------------------------------------------------
+# Request IDs: every request gets one, sent back in the X-Request-ID header,
+# included in every log line and in every error body.
+# ---------------------------------------------------------------------------
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+@app.middleware("http")
+async def assign_request_id(request: Request, call_next):
+    incoming = request.headers.get("X-Request-ID", "")
+    # Reuse the caller's ID if it looks safe, otherwise make a new one.
+    request_id = incoming if _SAFE_REQUEST_ID.match(incoming) else uuid.uuid4().hex[:16]
+    request.state.request_id = request_id
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# ---------------------------------------------------------------------------
+# One error format for every error response:
+#   {"error": {"code": "...", "message": "...", "request_id": "...", "details": {...}}}
+# ---------------------------------------------------------------------------
+class ErrorBody(BaseModel):
+    code: str = Field(description="Short machine-readable error code", examples=["double_booked"])
+    message: str = Field(description="Human-readable explanation")
+    request_id: str | None = Field(None, description="Matches the X-Request-ID header and the logs")
+    details: dict | None = Field(None, description="Extra information, when there is any")
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorBody
+
+
+def error_response(request: Request, status: int, code: str, message: str,
+                   details: dict | None = None, headers: dict | None = None) -> JSONResponse:
+    body = {"code": code, "message": message,
+            "request_id": getattr(request.state, "request_id", None)}
+    if details:
+        body["details"] = details
+    return JSONResponse(status_code=status, content={"error": body}, headers=headers)
+
+
+# Which HTTP status each kind of booking-rule problem becomes.
+# Anything not listed is 422: the request was readable but broke a rule.
+HTTP_STATUS_FOR = {
+    booking_core.AlreadyBooked: 409,
+    booking_core.BookingNotFound: 404,
 }
 
-SLOTS = ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
-         "12:00", "12:30", "13:00", "13:30", "14:00", "14:30",
-         "15:00", "15:30", "16:00", "16:30"]
 
-# (room, slot) -> list of student IDs. A pair can appear once => no double-booking.
-bookings: dict[tuple[str, str], list[str]] = {}
+def status_for(err: booking_core.BookingError) -> int:
+    return HTTP_STATUS_FOR.get(type(err), 422)
+
+
+@app.exception_handler(booking_core.BookingError)
+async def handle_booking_error(request: Request, err: booking_core.BookingError):
+    return error_response(request, status_for(err), err.reason, err.message, err.details)
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    if any(e["type"] == "json_invalid" for e in errors):
+        status, code, message, details = 400, "malformed_json", "The request body is not valid JSON.", None
+    else:
+        problems = [{"field": ".".join(str(p) for p in e["loc"]), "problem": e["msg"]} for e in errors]
+        status, code, message, details = 422, "validation_error", "Some fields are missing or invalid.", {"problems": problems}
+    log_event("request rejected", level="WARNING", method=request.method,
+              path=request.url.path, status=status, reason=code)
+    return error_response(request, status, code, message, details)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def handle_http_error(request: Request, exc: StarletteHTTPException):
+    # e.g. 404 for an unknown path, 405 for a wrong method
+    code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
+    return error_response(request, exc.status_code, code, str(exc.detail), headers=exc.headers)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def handle_rate_limited(request: Request, exc: RateLimitExceeded):
+    log_event("rate limited", level="WARNING", method=request.method, path=request.url.path,
+              client=exc.client, status=429, retry_after_seconds=exc.retry_after)
+    return error_response(
+        request, 429, "rate_limited",
+        f"Too many requests: at most {exc.limit} calls per {exc.window_seconds} seconds "
+        f"per client. Try again in {exc.retry_after} seconds.",
+        details={"limit": exc.limit, "window_seconds": exc.window_seconds,
+                 "retry_after_seconds": exc.retry_after, "client": exc.client},
+        headers={"Retry-After": str(exc.retry_after),
+                 "X-RateLimit-Limit": str(exc.limit),
+                 "X-RateLimit-Remaining": "0"},
+    )
+
+
+@app.exception_handler(InjectedFailure)
+async def handle_injected_failure(request: Request, exc: InjectedFailure):
+    return error_response(request, 503, "service_unavailable",
+                          "The booking service is temporarily unavailable (injected failure). Try again shortly.")
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception):
+    log_event("unhandled error", level="ERROR", path=request.url.path, error=repr(exc))
+    return error_response(request, 500, "internal_error", "Something went wrong on our side.")
+
+
+def header_doc(description: str, type_: str = "string") -> dict:
+    """OpenAPI helper: describe one response header."""
+    return {"description": description, "schema": {"type": type_}}
+
+
+RATE_LIMIT_HEADERS = {
+    "X-RateLimit-Limit": header_doc("Calls allowed per window", "integer"),
+    "X-RateLimit-Remaining": header_doc("Calls left in the current window", "integer"),
+}
+
+
+def errors(*codes: int) -> dict:
+    """OpenAPI helper: document that these status codes return ErrorResponse."""
+    descriptions = {400: "Malformed request", 404: "Not found", 409: "Conflict",
+                    422: "Invalid input or broken booking rule", 429: "Too many requests",
+                    503: "Service temporarily unavailable"}
+    docs = {c: {"model": ErrorResponse, "description": descriptions.get(c, "Error")} for c in codes}
+    if 429 in docs:
+        docs[429]["headers"] = {
+            "Retry-After": header_doc("Seconds to wait before calling again", "integer"),
+            **RATE_LIMIT_HEADERS,
+        }
+    return docs
+
+
+# ---------------------------------------------------------------------------
+# Request and response shapes
+# ---------------------------------------------------------------------------
+StudentId = Annotated[str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
 class BookingRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",   # unknown fields are rejected instead of silently ignored
+        json_schema_extra={"examples": [
+            {"room": "R3", "slot": "09:00", "student_ids": ["s1", "s2", "s3", "s4", "s5"]}
+        ]},
+    )
+    room: str = Field(description="Room code, R1 to R5")
+    slot: str = Field(description="Start time of a 30-minute slot, 09:00 to 16:30")
+    student_ids: list[StudentId] = Field(min_length=1, max_length=50,
+                                         description="Every student in the group, each listed once")
+
+
+class Booking(BaseModel):
+    id: str
     room: str
     slot: str
     student_ids: list[str]
+    group_size: int
+    created_at: str
 
 
-def rooms_that_fit(group_size: int, slot: str) -> list[str]:
-    """Rooms whose size range fits this group AND are free for this slot."""
-    return [
-        room for room, info in ROOMS.items()
-        if info["min_group"] <= group_size <= info["capacity"]
-        and (room, slot) not in bookings
-    ]
+class RoomInfo(BaseModel):
+    room: str
+    capacity: int
+    min_group: int
+    booked_slots: list[str]
+    free_slot_count: int
 
 
-@app.get("/")
+class FreeRoom(BaseModel):
+    room: str
+    capacity: int
+    min_group: int
+
+
+class Availability(BaseModel):
+    slot: str
+    group_size: int | None
+    free_rooms: list[FreeRoom]
+
+
+class DelaySetting(BaseModel):
+    seconds: float = Field(ge=0, le=10, description="Delay added to each booking's availability check; 0 turns it off")
+
+
+class CardinalitySetting(BaseModel):
+    active: bool
+
+
+class FailureSetting(BaseModel):
+    count: int = Field(ge=0, le=100, description="How many of the next POST /bookings requests fail with 503; 0 turns it off")
+
+
+class ChaosState(BaseModel):
+    delay_seconds: float
+    cardinality_bomb: bool
+    fail_next_bookings: int
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/", tags=["service"])
 def home():
     return {"service": "StudySlot", "status": "running"}
 
 
-@app.get("/health")
+@app.get("/health", tags=["service"])
 def health():
     return {"status": "ok"}
 
 
-@app.get("/rooms")
+@app.get("/rooms", response_model=list[RoomInfo], tags=["rooms"])
 def list_rooms():
-    """Every room with its size limits and how many slots are free."""
-    result = []
-    for room, info in ROOMS.items():
-        booked_slots = [slot for (r, slot) in bookings if r == room]
-        result.append({
-            "room": room,
-            "capacity": info["capacity"],
-            "min_group": info["min_group"],
-            "booked_slots": sorted(booked_slots),
-            "free_slot_count": len(SLOTS) - len(booked_slots),
-        })
-    return result
+    """Every room with its size limits and which slots are booked."""
+    return booking_core.list_rooms()
 
 
-@app.get("/availability")
-def availability(slot: str, group_size: int | None = None):
-    """Free rooms for a slot. Pass group_size to see only rooms that fit."""
-    if slot not in SLOTS:
-        raise HTTPException(status_code=400, detail=f"Unknown slot '{slot}'")
-    free = [room for room in ROOMS if (room, slot) not in bookings]
-    if group_size is not None:
-        free = [
-            room for room in free
-            if ROOMS[room]["min_group"] <= group_size <= ROOMS[room]["capacity"]
-        ]
-    return {
-        "slot": slot,
-        "group_size": group_size,
-        "free_rooms": [
-            {"room": r, "capacity": ROOMS[r]["capacity"], "min_group": ROOMS[r]["min_group"]}
-            for r in free
-        ],
-    }
+# ---------------------------------------------------------------------------
+# Rate limiting for GET /availability
+# Students refresh availability to hunt for a free room, so this is the
+# endpoint most likely to be hammered. Each client (identified by its IP
+# address) gets 5 calls in any 10-second period.
+# ---------------------------------------------------------------------------
+AVAILABILITY_LIMIT = 5
+AVAILABILITY_WINDOW_SECONDS = 10
+availability_limiter = SlidingWindowRateLimiter(AVAILABILITY_LIMIT, AVAILABILITY_WINDOW_SECONDS)
 
 
-@app.post("/book")
-def book(req: BookingRequest):
-    """Book a room for a slot for a group. Enforces size limits and no double-booking."""
-    request_id = uuid.uuid4().hex[:8]   # short unique ID for this request, e.g. "a3f9c1d2"
+def limit_availability_calls(request: Request, response: Response) -> None:
+    """Dependency: runs before /availability. Raises RateLimitExceeded when over the limit."""
+    client = request.client.host if request.client else "unknown"
+    remaining = availability_limiter.check(client)
+    response.headers["X-RateLimit-Limit"] = str(AVAILABILITY_LIMIT)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+
+
+@app.get("/availability", response_model=Availability,
+         responses={200: {"headers": RATE_LIMIT_HEADERS}, **errors(422, 429)},
+         dependencies=[Depends(limit_availability_calls)], tags=["rooms"])
+def availability(
+    slot: str = Query(description="Slot start time, e.g. 09:00"),
+    group_size: int | None = Query(None, ge=1, le=50, description="Only show rooms that fit this many students"),
+):
+    """Free rooms for a slot. Pass group_size to see only rooms that fit.
+
+    Rate limited: 5 calls per 10 seconds per client IP. Over the limit you get
+    429 with a Retry-After header saying how many seconds to wait.
+    """
+    return booking_core.availability(slot, group_size)
+
+
+@app.post("/bookings", status_code=201, response_model=Booking, tags=["bookings"],
+          responses={
+              201: {"description": "Booking created, or replayed for a repeated Idempotency-Key",
+                    "headers": {
+                        "Location": header_doc("URL of the booking, e.g. /bookings/{id}"),
+                        "Idempotent-Replayed": header_doc("'true' when this is a replay of an earlier request"),
+                    }},
+              **errors(400, 409, 422, 503),
+          })
+def create_booking(
+    req: BookingRequest,
+    response: Response,
+    idempotency_key: str | None = Header(
+        None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Optional but recommended. A unique value (e.g. a UUID) chosen by the client for "
+            "this booking. Retrying with the same key and body returns the original booking "
+            "instead of creating a new one or failing with 409."
+        ),
+    ),
+):
+    """Book a room for a slot. Returns 201 with a Location header pointing at the new booking.
+
+    A replayed request (same Idempotency-Key, same body) returns the original 201
+    response with the header `Idempotent-Replayed: true`.
+    """
+    if consume_injected_failure():     # chaos: simulated outage
+        log_event("booking failed", level="ERROR", status=503, reason="injected_failure")
+        raise InjectedFailure()
     if CARDINALITY_BOMB_ON:
-        CARDINALITY_DEMO.labels(request_id=request_id).inc()
+        CARDINALITY_DEMO.labels(request_id=request_id_var.get()).inc()
 
-    if req.room not in ROOMS:
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  status=400, reason="unknown_room")
-        raise HTTPException(status_code=400, detail=f"Unknown room '{req.room}'")
-    if req.slot not in SLOTS:
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  status=400, reason="unknown_slot")
-        raise HTTPException(status_code=400, detail=f"Unknown slot '{req.slot}'")
-    if not req.student_ids:
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  status=400, reason="no_student_ids")
-        raise HTTPException(status_code=400, detail="At least one student ID is required")
-
-    info = ROOMS[req.room]
-    group_size = len(req.student_ids)
-
-    # Start the stopwatch for the availability-check work.
-    start = time.perf_counter()
-    time.sleep(INJECTED_DELAY)   # chaos: 0 normally; >0 when delay is injected
-
-    def record_check_time():
-        """Record how long the availability check took, into both metrics."""
+    start = time.perf_counter()        # stopwatch for the availability check
+    time.sleep(INJECTED_DELAY)         # chaos: 0 normally; >0 when delay is injected
+    try:
+        booking, replayed = booking_core.create_booking(
+            req.room, req.slot, req.student_ids, idempotency_key=idempotency_key
+        )
+    except booking_core.BookingError as err:
+        log_event("booking rejected", level="WARNING", room=req.room, slot=req.slot,
+                  group_size=len(req.student_ids), status=status_for(err), reason=err.reason)
+        raise                          # handle_booking_error turns it into the error response
+    finally:
         elapsed = time.perf_counter() - start
         AVAILABILITY_CHECK_SECONDS.observe(elapsed)
         AVAILABILITY_CHECK_SUMMARY.observe(elapsed)
 
-    # Too big for this room?
-    if group_size > info["capacity"]:
-        record_check_time()
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  group_size=group_size, status=400, reason="group_too_large")
-        raise HTTPException(status_code=400, detail={
-            "reason": "group_too_large",
-            "message": f"Room {req.room} holds at most {info['capacity']} students; your group has {group_size}.",
-            "suggested_rooms": rooms_that_fit(group_size, req.slot),
-        })
-
-    # Too small for this room?
-    if group_size < info["min_group"]:
-        record_check_time()
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  group_size=group_size, status=400, reason="group_too_small")
-        raise HTTPException(status_code=400, detail={
-            "reason": "group_too_small",
-            "message": f"Room {req.room} needs at least {info['min_group']} students; your group has {group_size}.",
-            "suggested_rooms": rooms_that_fit(group_size, req.slot),
-        })
-
-    # Already booked?
-    key = (req.room, req.slot)
-    if key in bookings:
-        record_check_time()
-        log_event("booking rejected", level="WARNING",
-                  request_id=request_id, room=req.room, slot=req.slot,
-                  group_size=group_size, status=409, reason="double_booked")
-        raise HTTPException(status_code=409, detail={
-            "reason": "double_booked",
-            "message": f"Room {req.room} is already booked for {req.slot}.",
-        })
-
-    record_check_time()
-    bookings[key] = req.student_ids
-    BOOKINGS_TOTAL.inc()
-    ROOMS_OCCUPIED.inc()
-    log_event("booking confirmed", level="INFO",
-              request_id=request_id, room=req.room, slot=req.slot,
-              group_size=group_size, status=200)
-    return {
-        "message": "Booked",
-        "room": req.room,
-        "slot": req.slot,
-        "group_size": group_size,
-    }
+    response.headers["Location"] = f"/bookings/{booking['id']}"
+    if replayed:
+        response.headers["Idempotent-Replayed"] = "true"
+        log_event("booking replayed", level="INFO", booking_id=booking["id"], room=booking["room"],
+                  slot=booking["slot"], status=201, idempotent_replay=True)
+    else:
+        BOOKINGS_TOTAL.inc()           # count only bookings that were really created
+        log_event("booking confirmed", level="INFO", booking_id=booking["id"], room=booking["room"],
+                  slot=booking["slot"], group_size=booking["group_size"], status=201)
+    return booking
 
 
-@app.get("/bookings")
+@app.get("/bookings", response_model=list[Booking], tags=["bookings"])
 def list_bookings():
     """Librarian view: everything currently booked."""
-    return [
-        {"room": room, "slot": slot, "student_ids": ids}
-        for (room, slot), ids in sorted(bookings.items())
-    ]
+    return booking_core.list_bookings()
 
 
-@app.delete("/bookings/{room}/{slot}")
-def cancel(room: str, slot: str):
-    """Cancel a booking, freeing that room+slot."""
-    key = (room, slot)
-    if key not in bookings:
-        raise HTTPException(status_code=404, detail="No such booking")
-    del bookings[key]
-    ROOMS_OCCUPIED.dec()
-    log_event("booking cancelled", level="INFO", room=room, slot=slot, status=200)
-    return {"message": "Cancelled", "room": room, "slot": slot}
+@app.get("/bookings/{booking_id}", response_model=Booking, responses=errors(404, 422), tags=["bookings"])
+def get_booking(booking_id: uuid.UUID):
+    """One booking by its ID."""
+    return booking_core.get_booking(str(booking_id))
 
-@app.get("/metrics")
+
+@app.delete("/bookings/{booking_id}", status_code=204, responses=errors(404, 422), tags=["bookings"])
+def cancel_booking(booking_id: uuid.UUID):
+    """Cancel a booking. Returns 204 with no body."""
+    booking = booking_core.cancel_booking(str(booking_id))
+    log_event("booking cancelled", level="INFO", booking_id=booking["id"],
+              room=booking["room"], slot=booking["slot"], status=204)
+    return Response(status_code=204)
+
+
+@app.get("/redoc", include_in_schema=False)
+def redoc():
+    """API reference page drawn from the OpenAPI spec.
+
+    FastAPI 0.109 loads ReDoc from the CDN tag "redoc@next", which no longer
+    renders (blank page), so we point it at the stable 2.x release instead.
+    """
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title="StudySlot - ReDoc",
+        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
+    )
+
+
+@app.get("/metrics", response_class=PlainTextResponse, tags=["service"],
+         responses={200: {"description": "Prometheus text exposition format"}})
 def metrics():
     """The page Prometheus scrapes. Plain text, not JSON."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/chaos/delay")
-def set_delay(seconds: float = 0.0):
-    """Turn the artificial availability-check delay on/off. seconds=0 disables it."""
+
+# --- Chaos switches (from A1) ---
+def chaos_state() -> dict:
+    return {"delay_seconds": INJECTED_DELAY, "cardinality_bomb": CARDINALITY_BOMB_ON,
+            "fail_next_bookings": FAIL_NEXT_BOOKINGS}
+
+
+@app.get("/chaos", response_model=ChaosState, tags=["chaos"])
+def get_chaos():
+    """Current chaos settings."""
+    return chaos_state()
+
+
+@app.put("/chaos/delay", response_model=ChaosState, responses=errors(422), tags=["chaos"])
+def set_delay(setting: DelaySetting):
+    """Set the artificial availability-check delay. 0 turns it off."""
     global INJECTED_DELAY
-    INJECTED_DELAY = seconds
-    log_event("chaos delay set", level="WARNING", injected_delay_seconds=seconds)
-    return {"injected_delay_seconds": INJECTED_DELAY}
+    INJECTED_DELAY = setting.seconds
+    log_event("chaos delay set", level="WARNING", injected_delay_seconds=setting.seconds)
+    return chaos_state()
 
 
-@app.get("/chaos/status")
-def chaos_status():
-    """Show current chaos state."""
-    return {"injected_delay_seconds": INJECTED_DELAY}
-
-@app.post("/chaos/cardinality")
-def set_cardinality(active: bool = False):
-    """Arm/disarm the cardinality bomb (per-request_id metric label)."""
+@app.put("/chaos/cardinality", response_model=ChaosState, responses=errors(422), tags=["chaos"])
+def set_cardinality(setting: CardinalitySetting):
+    """Arm or disarm the cardinality bomb (per-request_id metric label)."""
     global CARDINALITY_BOMB_ON
-    CARDINALITY_BOMB_ON = active
-    log_event("chaos cardinality set", level="WARNING", cardinality_bomb=active)
-    return {"cardinality_bomb": CARDINALITY_BOMB_ON}
+    CARDINALITY_BOMB_ON = setting.active
+    log_event("chaos cardinality set", level="WARNING", cardinality_bomb=setting.active)
+    return chaos_state()
+
+
+@app.put("/chaos/failures", response_model=ChaosState, responses=errors(422), tags=["chaos"])
+def set_failures(setting: FailureSetting):
+    """Make the next N POST /bookings requests fail with 503 (simulated outage). 0 turns it off."""
+    global FAIL_NEXT_BOOKINGS
+    with _chaos_lock:
+        FAIL_NEXT_BOOKINGS = setting.count
+    log_event("chaos failures set", level="WARNING", fail_next_bookings=setting.count)
+    return chaos_state()

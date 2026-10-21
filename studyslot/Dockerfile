@@ -5,7 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+# Copy all the app's Python modules (not just main.py any more).
+# .dockerignore keeps caches, logs and local data out of the image.
+COPY . .
 
 EXPOSE 8000
 

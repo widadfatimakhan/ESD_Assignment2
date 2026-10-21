@@ -1,0 +1,898 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "StudySlot",
+    "description": "Campus study-room booking service (ESD Assignment 2).\n\n- Every response carries an `X-Request-ID` header. Send your own to correlate calls; otherwise one is generated. The same ID appears in the logs and in error bodies.\n- Every error uses the `ErrorResponse` shape: `{\"error\": {\"code\", \"message\", \"request_id\", \"details\"}}`.\n- `POST /bookings` accepts an `Idempotency-Key` header so retries are safe.\n- `GET /availability` is rate limited to 5 calls per 10 seconds per client IP.",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "tags": [
+          "service"
+        ],
+        "summary": "Home",
+        "operationId": "home__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "service"
+        ],
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rooms": {
+      "get": {
+        "tags": [
+          "rooms"
+        ],
+        "summary": "List Rooms",
+        "description": "Every room with its size limits and which slots are booked.",
+        "operationId": "list_rooms_rooms_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RoomInfo"
+                  },
+                  "type": "array",
+                  "title": "Response List Rooms Rooms Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/availability": {
+      "get": {
+        "tags": [
+          "rooms"
+        ],
+        "summary": "Availability",
+        "description": "Free rooms for a slot. Pass group_size to see only rooms that fit.\n\nRate limited: 5 calls per 10 seconds per client IP. Over the limit you get\n429 with a Retry-After header saying how many seconds to wait.",
+        "operationId": "availability_availability_get",
+        "parameters": [
+          {
+            "name": "slot",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Slot start time, e.g. 09:00",
+              "title": "Slot"
+            },
+            "description": "Slot start time, e.g. 09:00"
+          },
+          {
+            "name": "group_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 50,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only show rooms that fit this many students",
+              "title": "Group Size"
+            },
+            "description": "Only show rooms that fit this many students"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Availability"
+                }
+              }
+            },
+            "headers": {
+              "X-RateLimit-Limit": {
+                "description": "Calls allowed per window",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-RateLimit-Remaining": {
+                "description": "Calls left in the current window",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before calling again",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-RateLimit-Limit": {
+                "description": "Calls allowed per window",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-RateLimit-Remaining": {
+                "description": "Calls left in the current window",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bookings": {
+      "post": {
+        "tags": [
+          "bookings"
+        ],
+        "summary": "Create Booking",
+        "description": "Book a room for a slot. Returns 201 with a Location header pointing at the new booking.\n\nA replayed request (same Idempotency-Key, same body) returns the original 201\nresponse with the header `Idempotent-Replayed: true`.",
+        "operationId": "create_booking_bookings_post",
+        "parameters": [
+          {
+            "name": "idempotency-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 8,
+                  "maxLength": 64,
+                  "pattern": "^[A-Za-z0-9_-]+$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional but recommended. A unique value (e.g. a UUID) chosen by the client for this booking. Retrying with the same key and body returns the original booking instead of creating a new one or failing with 409.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Optional but recommended. A unique value (e.g. a UUID) chosen by the client for this booking. Retrying with the same key and body returns the original booking instead of creating a new one or failing with 409."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BookingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Booking created, or replayed for a repeated Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Booking"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "description": "URL of the booking, e.g. /bookings/{id}",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Idempotent-Replayed": {
+                "description": "'true' when this is a replay of an earlier request",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "bookings"
+        ],
+        "summary": "List Bookings",
+        "description": "Librarian view: everything currently booked.",
+        "operationId": "list_bookings_bookings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Booking"
+                  },
+                  "title": "Response List Bookings Bookings Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bookings/{booking_id}": {
+      "get": {
+        "tags": [
+          "bookings"
+        ],
+        "summary": "Get Booking",
+        "description": "One booking by its ID.",
+        "operationId": "get_booking_bookings__booking_id__get",
+        "parameters": [
+          {
+            "name": "booking_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Booking Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Booking"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "bookings"
+        ],
+        "summary": "Cancel Booking",
+        "description": "Cancel a booking. Returns 204 with no body.",
+        "operationId": "cancel_booking_bookings__booking_id__delete",
+        "parameters": [
+          {
+            "name": "booking_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Booking Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "service"
+        ],
+        "summary": "Metrics",
+        "description": "The page Prometheus scrapes. Plain text, not JSON.",
+        "operationId": "metrics_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Prometheus text exposition format",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chaos": {
+      "get": {
+        "tags": [
+          "chaos"
+        ],
+        "summary": "Get Chaos",
+        "description": "Current chaos settings.",
+        "operationId": "get_chaos_chaos_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosState"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chaos/delay": {
+      "put": {
+        "tags": [
+          "chaos"
+        ],
+        "summary": "Set Delay",
+        "description": "Set the artificial availability-check delay. 0 turns it off.",
+        "operationId": "set_delay_chaos_delay_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelaySetting"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chaos/cardinality": {
+      "put": {
+        "tags": [
+          "chaos"
+        ],
+        "summary": "Set Cardinality",
+        "description": "Arm or disarm the cardinality bomb (per-request_id metric label).",
+        "operationId": "set_cardinality_chaos_cardinality_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CardinalitySetting"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chaos/failures": {
+      "put": {
+        "tags": [
+          "chaos"
+        ],
+        "summary": "Set Failures",
+        "description": "Make the next N POST /bookings requests fail with 503 (simulated outage). 0 turns it off.",
+        "operationId": "set_failures_chaos_failures_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FailureSetting"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input or broken booking rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Availability": {
+        "properties": {
+          "slot": {
+            "type": "string",
+            "title": "Slot"
+          },
+          "group_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Size"
+          },
+          "free_rooms": {
+            "items": {
+              "$ref": "#/components/schemas/FreeRoom"
+            },
+            "type": "array",
+            "title": "Free Rooms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "slot",
+          "group_size",
+          "free_rooms"
+        ],
+        "title": "Availability"
+      },
+      "Booking": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "room": {
+            "type": "string",
+            "title": "Room"
+          },
+          "slot": {
+            "type": "string",
+            "title": "Slot"
+          },
+          "student_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Student Ids"
+          },
+          "group_size": {
+            "type": "integer",
+            "title": "Group Size"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "room",
+          "slot",
+          "student_ids",
+          "group_size",
+          "created_at"
+        ],
+        "title": "Booking"
+      },
+      "BookingRequest": {
+        "properties": {
+          "room": {
+            "type": "string",
+            "title": "Room",
+            "description": "Room code, R1 to R5"
+          },
+          "slot": {
+            "type": "string",
+            "title": "Slot",
+            "description": "Start time of a 30-minute slot, 09:00 to 16:30"
+          },
+          "student_ids": {
+            "items": {
+              "type": "string",
+              "maxLength": 32,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Student Ids",
+            "description": "Every student in the group, each listed once"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "room",
+          "slot",
+          "student_ids"
+        ],
+        "title": "BookingRequest",
+        "examples": [
+          {
+            "room": "R3",
+            "slot": "09:00",
+            "student_ids": [
+              "s1",
+              "s2",
+              "s3",
+              "s4",
+              "s5"
+            ]
+          }
+        ]
+      },
+      "CardinalitySetting": {
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "title": "Active"
+          }
+        },
+        "type": "object",
+        "required": [
+          "active"
+        ],
+        "title": "CardinalitySetting"
+      },
+      "ChaosState": {
+        "properties": {
+          "delay_seconds": {
+            "type": "number",
+            "title": "Delay Seconds"
+          },
+          "cardinality_bomb": {
+            "type": "boolean",
+            "title": "Cardinality Bomb"
+          },
+          "fail_next_bookings": {
+            "type": "integer",
+            "title": "Fail Next Bookings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "delay_seconds",
+          "cardinality_bomb",
+          "fail_next_bookings"
+        ],
+        "title": "ChaosState"
+      },
+      "DelaySetting": {
+        "properties": {
+          "seconds": {
+            "type": "number",
+            "maximum": 10.0,
+            "minimum": 0.0,
+            "title": "Seconds",
+            "description": "Delay added to each booking's availability check; 0 turns it off"
+          }
+        },
+        "type": "object",
+        "required": [
+          "seconds"
+        ],
+        "title": "DelaySetting"
+      },
+      "ErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Short machine-readable error code",
+            "examples": [
+              "double_booked"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable explanation"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id",
+            "description": "Matches the X-Request-ID header and the logs"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details",
+            "description": "Extra information, when there is any"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorBody"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse"
+      },
+      "FailureSetting": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Count",
+            "description": "How many of the next POST /bookings requests fail with 503; 0 turns it off"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count"
+        ],
+        "title": "FailureSetting"
+      },
+      "FreeRoom": {
+        "properties": {
+          "room": {
+            "type": "string",
+            "title": "Room"
+          },
+          "capacity": {
+            "type": "integer",
+            "title": "Capacity"
+          },
+          "min_group": {
+            "type": "integer",
+            "title": "Min Group"
+          }
+        },
+        "type": "object",
+        "required": [
+          "room",
+          "capacity",
+          "min_group"
+        ],
+        "title": "FreeRoom"
+      },
+      "RoomInfo": {
+        "properties": {
+          "room": {
+            "type": "string",
+            "title": "Room"
+          },
+          "capacity": {
+            "type": "integer",
+            "title": "Capacity"
+          },
+          "min_group": {
+            "type": "integer",
+            "title": "Min Group"
+          },
+          "booked_slots": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Booked Slots"
+          },
+          "free_slot_count": {
+            "type": "integer",
+            "title": "Free Slot Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "room",
+          "capacity",
+          "min_group",
+          "booked_slots",
+          "free_slot_count"
+        ],
+        "title": "RoomInfo"
+      }
+    }
+  }
+}
