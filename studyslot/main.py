@@ -24,7 +24,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import booking_core
 import db
-from logging_setup import log_event, request_id_var
+from logging_setup import log_event, request_id_var, trace_context_var
+from tracing import child_span
 from rate_limit import RateLimitExceeded, SlidingWindowRateLimiter
 
 db.init_db()   # create the database file and table on startup if needed
@@ -36,6 +37,9 @@ app = FastAPI(
         "Campus study-room booking service (ESD Assignment 2).\n\n"
         "- Every response carries an `X-Request-ID` header. Send your own to correlate calls; "
         "otherwise one is generated. The same ID appears in the logs and in error bodies.\n"
+        "- W3C Trace Context: send a `traceparent` header to join an existing trace. The response "
+        "`traceparent` carries the same trace-id with this service's span-id, and every log line "
+        "includes `trace.id` (shared with the gRPC service for the same trace).\n"
         "- Every error uses the `ErrorResponse` shape: `{\"error\": {\"code\", \"message\", "
         "\"request_id\", \"details\"}}`.\n"
         "- `POST /bookings` accepts an `Idempotency-Key` header so retries are safe.\n"
@@ -102,8 +106,12 @@ AVAILABILITY_CHECK_SUMMARY = Summary(
 
 
 # ---------------------------------------------------------------------------
-# Request IDs: every request gets one, sent back in the X-Request-ID header,
-# included in every log line and in every error body.
+# Request IDs and tracing.
+# - X-Request-ID: one ID per request, sent back in the response header,
+#   included in every log line and in every error body.
+# - traceparent (W3C Trace Context, as in the course lab): the trace-id is
+#   shared by every service that handles one operation; each request gets
+#   its own span-id. Logged as trace.id / span.id.
 # ---------------------------------------------------------------------------
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
@@ -114,12 +122,16 @@ async def assign_request_id(request: Request, call_next):
     # Reuse the caller's ID if it looks safe, otherwise make a new one.
     request_id = incoming if _SAFE_REQUEST_ID.match(incoming) else uuid.uuid4().hex[:16]
     request.state.request_id = request_id
+    span = child_span(request.headers.get("traceparent"))
     token = request_id_var.set(request_id)
+    trace_token = trace_context_var.set(span)
     try:
         response = await call_next(request)
     finally:
         request_id_var.reset(token)
+        trace_context_var.reset(trace_token)
     response.headers["X-Request-ID"] = request_id
+    response.headers["traceparent"] = span["traceparent"]
     return response
 
 

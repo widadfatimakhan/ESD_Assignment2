@@ -18,6 +18,10 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "studyslot")
 # log line automatically, so all lines from one request can be found together.
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
+# The W3C trace context of the current request (see tracing.py), set by the
+# same middleware / interceptor. log_event() adds trace.id and span.id from it.
+trace_context_var: ContextVar[dict | None] = ContextVar("trace_context", default=None)
+
 _logger = logging.getLogger(SERVICE_NAME)
 _logger.setLevel(logging.INFO)
 _logger.propagate = False
@@ -45,6 +49,12 @@ def log_event(message: str, *, level: str = "INFO", **fields) -> None:
     request_id = request_id_var.get()
     if request_id:
         record["request_id"] = request_id
+    span = trace_context_var.get()
+    if span:
+        record["trace"] = {"id": span["trace_id"]}
+        record["span"] = {"id": span["span_id"]}
+        if span.get("parent_span_id"):
+            record["span"]["parent_id"] = span["parent_span_id"]
     record.update(fields)
     line = json.dumps(record, separators=(",", ":"))
     getattr(_logger, level.lower(), _logger.info)(line)

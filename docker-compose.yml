@@ -76,5 +76,24 @@ services:
       - "co.elastic.logs/json.overwrite_keys=true"
       - "co.elastic.logs/json.add_error_key=true"
 
+  # Part B: the gRPC version of CreateBooking. Same code and image as
+  # studyslot-app, but it runs grpc_server.py instead of the HTTP API, and it
+  # mounts the SAME volume, so both read and write the same database file.
+  studyslot-grpc:
+    build: ./studyslot
+    container_name: studyslot-grpc
+    command: ["python", "-u", "grpc_server.py"]
+    ports:
+      - "50051:50051"
+    environment:
+      - STUDYSLOT_DB_PATH=/data/studyslot.db
+      - SERVICE_NAME=studyslot-grpc
+    volumes:
+      - studyslot-data:/data
+    labels:
+      - "co.elastic.logs/json.keys_under_root=true"
+      - "co.elastic.logs/json.overwrite_keys=true"
+      - "co.elastic.logs/json.add_error_key=true"
+
 volumes:
   studyslot-data:
