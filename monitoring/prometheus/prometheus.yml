@@ -3,9 +3,15 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
+    # HTTP API (FastAPI) - metrics on the same port as the API
     - job_name: 'studyslot'
       static_configs:
         - targets: ['studyslot-app:8000']
+
+    # gRPC service (Part B/C) - gRPC on 50051, metrics on a separate HTTP port 9101
+    - job_name: 'studyslot-grpc'
+      static_configs:
+        - targets: ['studyslot-grpc:9101']
 
     - job_name: 'node-exporter'
       static_configs:

@@ -17,15 +17,17 @@ from fastapi.openapi.docs import get_redoc_html
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import (
-    Counter, Gauge, Histogram, Summary,
+    Counter, Gauge, Histogram,
     generate_latest, CONTENT_TYPE_LATEST,
 )
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 import booking_core
 import db
 from logging_setup import log_event, request_id_var, trace_context_var
 from tracing import child_span
+from metrics import BOOKINGS_TOTAL, IDEMPOTENT_REPLAYS, LATENCY_BUCKETS
 from rate_limit import RateLimitExceeded, SlidingWindowRateLimiter
 
 db.init_db()   # create the database file and table on startup if needed
@@ -49,7 +51,10 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
-# Metrics (same as A1)
+# Metrics
+# A1 metrics are kept (see the Part C audit in REPORT.md); the business
+# counters studyslot_bookings_total and studyslot_idempotent_replays_total
+# now live in metrics.py so the gRPC service reports them too.
 # ---------------------------------------------------------------------------
 # DELIBERATELY BAD metric for the A1 cardinality experiment: a per-request-ID label.
 CARDINALITY_DEMO = Counter(
@@ -58,11 +63,6 @@ CARDINALITY_DEMO = Counter(
     ["request_id"],
 )
 CARDINALITY_BOMB_ON = False
-
-BOOKINGS_TOTAL = Counter(
-    "studyslot_bookings_total",
-    "Total number of successful room bookings",
-)
 
 # Reads the count from the database at every scrape, so it stays correct after
 # restarts and when the gRPC service changes bookings too.
@@ -99,9 +99,23 @@ AVAILABILITY_CHECK_SECONDS = Histogram(
     "Time spent checking room availability during a booking",
     buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
 )
-AVAILABILITY_CHECK_SUMMARY = Summary(
-    "studyslot_availability_check_summary_seconds",
-    "Summary of availability-check duration (average via _sum / _count)",
+
+# --- Part C: request metrics for every HTTP route (RED: rate, errors, duration) ---
+HTTP_REQUESTS = Counter(
+    "http_requests_total",
+    "HTTP requests handled, by method, route template and status code",
+    ["method", "route", "status"],
+)
+HTTP_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "Time to handle an HTTP request, measured on the server",
+    ["method", "route"],
+    buckets=LATENCY_BUCKETS,
+)
+HTTP_IN_FLIGHT = Gauge(
+    "http_requests_in_flight",
+    "HTTP requests being handled right now",
+    ["method", "route"],
 )
 
 
@@ -133,6 +147,47 @@ async def assign_request_id(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["traceparent"] = span["traceparent"]
     return response
+
+
+# ---------------------------------------------------------------------------
+# Request metrics (Part C). Labels use the route TEMPLATE, e.g.
+# "/bookings/{booking_id}", never the real path with an ID in it, so the
+# number of time series stays small and fixed.
+# ---------------------------------------------------------------------------
+_KNOWN_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+
+
+def route_label(request: Request) -> str:
+    """The route template this request matches, or "unmatched" for unknown paths."""
+    partial = None
+    for route in app.router.routes:
+        match, _ = route.matches(request.scope)
+        if match == Match.FULL:
+            return route.path
+        if match == Match.PARTIAL and partial is None:   # right path, wrong method (405)
+            partial = route.path
+    return partial or "unmatched"
+
+
+@app.middleware("http")
+async def measure_http_requests(request: Request, call_next):
+    route = route_label(request)
+    if route == "/metrics":                 # don't measure Prometheus scraping us
+        return await call_next(request)
+    method = request.method if request.method in _KNOWN_METHODS else "other"
+
+    in_flight = HTTP_IN_FLIGHT.labels(method=method, route=route)
+    in_flight.inc()
+    start = time.perf_counter()
+    status = 500                            # if the app crashes, count it as a 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        HTTP_DURATION.labels(method=method, route=route).observe(time.perf_counter() - start)
+        HTTP_REQUESTS.labels(method=method, route=route, status=str(status)).inc()
+        in_flight.dec()
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +265,15 @@ async def handle_rate_limited(request: Request, exc: RateLimitExceeded):
                  "X-RateLimit-Limit": str(exc.limit),
                  "X-RateLimit-Remaining": "0"},
     )
+
+
+@app.exception_handler(db.StorageBusy)
+async def handle_storage_busy(request: Request, exc: db.StorageBusy):
+    log_event("storage busy", level="WARNING", method=request.method,
+              path=request.url.path, status=503, reason="storage_busy")
+    return error_response(request, 503, "storage_busy",
+                          "The booking database is busy right now. Nothing was changed; please retry.",
+                          headers={"Retry-After": "1"})
 
 
 @app.exception_handler(InjectedFailure)
@@ -411,13 +475,12 @@ def create_booking(
                   group_size=len(req.student_ids), status=status_for(err), reason=err.reason)
         raise                          # handle_booking_error turns it into the error response
     finally:
-        elapsed = time.perf_counter() - start
-        AVAILABILITY_CHECK_SECONDS.observe(elapsed)
-        AVAILABILITY_CHECK_SUMMARY.observe(elapsed)
+        AVAILABILITY_CHECK_SECONDS.observe(time.perf_counter() - start)
 
     response.headers["Location"] = f"/bookings/{booking['id']}"
     if replayed:
         response.headers["Idempotent-Replayed"] = "true"
+        IDEMPOTENT_REPLAYS.inc()
         log_event("booking replayed", level="INFO", booking_id=booking["id"], room=booking["room"],
                   slot=booking["slot"], status=201, idempotent_replay=True)
     else:
@@ -439,7 +502,7 @@ def get_booking(booking_id: uuid.UUID):
     return booking_core.get_booking(str(booking_id))
 
 
-@app.delete("/bookings/{booking_id}", status_code=204, responses=errors(404, 422), tags=["bookings"])
+@app.delete("/bookings/{booking_id}", status_code=204, responses=errors(404, 422, 503), tags=["bookings"])
 def cancel_booking(booking_id: uuid.UUID):
     """Cancel a booking. Returns 204 with no body."""
     booking = booking_core.cancel_booking(str(booking_id))

@@ -67,6 +67,13 @@ same rules (`booking_core.py`) and database as the HTTP API.
 - Both servers accept W3C `traceparent` (header / metadata) and log `trace.id`.
 - Call paths: `docs/a2/call-paths.md`
 
+## Metrics (Assignment 2, Part C)
+- Prometheus scrapes `studyslot` (:8000/metrics), `studyslot-grpc` (:9101/metrics) and node-exporter.
+- Grafana dashboard **StudySlot A2: HTTP vs gRPC (create booking)** shows calls and error
+  ratio by status, p50/p95 latency (server side, 1-minute window), duration heatmaps,
+  in-flight requests, bookings and idempotent replays, HTTP beside gRPC.
+- Populate it: `.venv\Scripts\python scripts/generate_traffic.py` (60 s steady + 30 s burst).
+
 ## Stop and clean up
 - Pause (keeps data): `docker compose stop`
 - Stop and remove containers (keeps named volumes): `docker compose down`

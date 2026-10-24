@@ -16,25 +16,55 @@ Generated code used here (from booking.proto, see the generation command there):
 import os
 import re
 import signal
+import time
 import uuid
 from concurrent import futures
 
 import grpc
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 import booking_core
 import booking_pb2
 import booking_pb2_grpc
 import db
 from logging_setup import log_event, request_id_var, trace_context_var
+from metrics import BOOKINGS_TOTAL, IDEMPOTENT_REPLAYS, LATENCY_BUCKETS
 from tracing import child_span
 
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9101"))   # Prometheus scrapes http://studyslot-grpc:9101/metrics
+
+# ---------------------------------------------------------------------------
+# Metrics (Part C), recorded for every RPC by MetricsInterceptor below.
+# Names follow the common gRPC conventions (grpc_server_*). Labels are the
+# service and method names and the status code: small, fixed sets.
+# ---------------------------------------------------------------------------
+GRPC_HANDLED = Counter(
+    "grpc_server_handled_total",
+    "RPCs completed on the server, by service, method and gRPC status code",
+    ["grpc_service", "grpc_method", "grpc_code"],
+)
+GRPC_DURATION = Histogram(
+    "grpc_server_handling_seconds",
+    "Time to handle an RPC, measured on the server (request received to response sent)",
+    ["grpc_service", "grpc_method"],
+    buckets=LATENCY_BUCKETS,
+)
+GRPC_IN_FLIGHT = Gauge(
+    "grpc_server_in_flight_requests",
+    "RPCs being handled right now",
+    ["grpc_service", "grpc_method"],
+)
 
 # Which gRPC status each kind of booking-rule problem becomes.
 # Anything not listed is INVALID_ARGUMENT (the gRPC equivalent of HTTP 422).
 GRPC_STATUS_FOR = {
     booking_core.AlreadyBooked: grpc.StatusCode.ALREADY_EXISTS,      # HTTP 409
     booking_core.BookingNotFound: grpc.StatusCode.NOT_FOUND,         # HTTP 404
+    # The request itself is fine; it clashes with what the server already
+    # remembers about this key. gRPC calls that FAILED_PRECONDITION
+    # (INVALID_ARGUMENT is for input that is wrong whatever the state).
+    booking_core.IdempotencyKeyReused: grpc.StatusCode.FAILED_PRECONDITION,   # HTTP 422
 }
 
 
@@ -63,10 +93,19 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
             # human-readable message as the status details.
             context.set_trailing_metadata((("error-code", err.reason),))
             context.abort(code, err.message)
+        except db.StorageBusy:                         # database busy: nothing written, safe to retry
+            log_event("storage busy", level="WARNING", rpc="CreateBooking",
+                      grpc_code="UNAVAILABLE", reason="storage_busy")
+            context.set_trailing_metadata((("error-code", "storage_busy"),))
+            context.abort(grpc.StatusCode.UNAVAILABLE, "The booking database is busy right now; please retry.")
         except Exception as exc:                       # anything unexpected
             log_event("unhandled error", level="ERROR", rpc="CreateBooking", error=repr(exc))
             context.abort(grpc.StatusCode.INTERNAL, "Something went wrong on our side.")
 
+        if replayed:
+            IDEMPOTENT_REPLAYS.inc()
+        else:
+            BOOKINGS_TOTAL.inc()
         log_event("booking replayed" if replayed else "booking confirmed", level="INFO",
                   rpc="CreateBooking", booking_id=booking["id"], room=booking["room"],
                   slot=booking["slot"], group_size=booking["group_size"], grpc_code="OK",
@@ -129,6 +168,45 @@ class TracingInterceptor(grpc.ServerInterceptor):
         )
 
 
+class MetricsInterceptor(grpc.ServerInterceptor):
+    """Counts every RPC by status code, times it, and tracks how many are in progress."""
+
+    def intercept_service(self, continuation, handler_call_details):
+        handler = continuation(handler_call_details)
+        if handler is None or handler.unary_unary is None:
+            return handler      # unknown method: gRPC itself answers UNIMPLEMENTED
+
+        # "/studyslot.v1.BookingService/CreateBooking" -> service, method
+        service, method = handler_call_details.method.lstrip("/").split("/", 1)
+        original = handler.unary_unary
+
+        def measured(request, context):
+            in_flight = GRPC_IN_FLIGHT.labels(grpc_service=service, grpc_method=method)
+            in_flight.inc()
+            start = time.perf_counter()
+            code = grpc.StatusCode.UNKNOWN
+            try:
+                response = original(request, context)
+                code = context.code() or grpc.StatusCode.OK
+                return response
+            except Exception:
+                # context.abort() raises; the status it set is still on the context.
+                code = context.code() or grpc.StatusCode.UNKNOWN
+                raise
+            finally:
+                GRPC_DURATION.labels(grpc_service=service, grpc_method=method).observe(
+                    time.perf_counter() - start)
+                GRPC_HANDLED.labels(grpc_service=service, grpc_method=method,
+                                    grpc_code=code.name).inc()
+                in_flight.dec()
+
+        return grpc.unary_unary_rpc_method_handler(
+            measured,
+            request_deserializer=handler.request_deserializer,
+            response_serializer=handler.response_serializer,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Server start-up
 # ---------------------------------------------------------------------------
@@ -136,7 +214,8 @@ def create_server(address: str = f"[::]:{GRPC_PORT}") -> tuple[grpc.Server, int]
     """Build the server (not started yet). Returns it and the port it bound."""
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=10),
-        interceptors=[TracingInterceptor()],
+        # Order matters: MetricsInterceptor is outermost, so its timing covers everything.
+        interceptors=[MetricsInterceptor(), TracingInterceptor()],
     )
     booking_pb2_grpc.add_BookingServiceServicer_to_server(BookingService(), server)
     port = server.add_insecure_port(address)
@@ -145,9 +224,10 @@ def create_server(address: str = f"[::]:{GRPC_PORT}") -> tuple[grpc.Server, int]
 
 def serve() -> None:
     db.init_db()
+    start_http_server(METRICS_PORT)          # /metrics for Prometheus, on its own port
     server, port = create_server()
     server.start()
-    log_event("grpc server started", level="INFO", port=port)
+    log_event("grpc server started", level="INFO", port=port, metrics_port=METRICS_PORT)
 
     # "docker compose stop" sends SIGTERM: finish in-flight calls (up to 5 s), then exit.
     signal.signal(signal.SIGTERM, lambda *_: server.stop(grace=5))

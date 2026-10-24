@@ -65,6 +65,13 @@ def test_invalid_input_is_invalid_argument(stub, bad, reason):
     assert dict(err.trailing_metadata())["error-code"] == reason
 
 
+def test_key_reused_for_a_different_booking_is_failed_precondition(stub):
+    stub.CreateBooking(request(key="grpc-key-0002"), timeout=2)
+    err = rpc_error(lambda: stub.CreateBooking(request(slot="09:30", key="grpc-key-0002"), timeout=2))
+    assert err.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert dict(err.trailing_metadata())["error-code"] == "idempotency_key_reused"
+
+
 def test_idempotent_retry_replays(stub):
     first = stub.CreateBooking(request(key="grpc-key-0001"), timeout=2)
     second = stub.CreateBooking(request(key="grpc-key-0001"), timeout=2)
@@ -117,3 +124,15 @@ def test_idempotency_key_is_shared_between_apis(stub, client, booking_body):
     http = client.post("/bookings", json=booking_body, headers={"Idempotency-Key": "shared-key-01"})
     grpc_booking = stub.CreateBooking(request(key="shared-key-01"), timeout=2)
     assert grpc_booking.replayed and grpc_booking.id == http.json()["id"]
+
+
+def test_busy_database_is_unavailable(stub, monkeypatch):
+    import db
+
+    def always_busy(*args, **kwargs):
+        raise db.StorageBusy("database busy")
+
+    monkeypatch.setattr(db, "insert_booking", always_busy)
+    err = rpc_error(lambda: stub.CreateBooking(request(), timeout=2))
+    assert err.code() == grpc.StatusCode.UNAVAILABLE
+    assert dict(err.trailing_metadata())["error-code"] == "storage_busy"

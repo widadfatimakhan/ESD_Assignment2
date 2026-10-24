@@ -7,6 +7,7 @@ Docker volume, so they always see the same bookings.
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -26,6 +27,25 @@ class IdempotencyKeyConflict(Exception):
     """Raised when an Idempotency-Key is reused with a different request body."""
 
 
+class StorageBusy(Exception):
+    """Other writers kept the database locked for longer than the busy timeout.
+
+    Nothing was written, so the request is safe to retry. The HTTP API turns
+    this into 503 + Retry-After, the gRPC API into UNAVAILABLE.
+    """
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
+# SQLite allows one writer at a time. Queue this process's own threads here,
+# so only the two processes (HTTP and gRPC containers) compete for SQLite's
+# lock. Without this, under heavy load some threads kept losing the race.
+_write_lock = threading.Lock()
+
+
 @contextmanager
 def connect():
     """Open a connection, commit if the block succeeds, roll back if it fails, always close."""
@@ -34,6 +54,10 @@ def connect():
     try:
         with conn:
             yield conn
+    except sqlite3.OperationalError as exc:
+        if _is_busy(exc):
+            raise StorageBusy("database busy") from exc
+        raise
     finally:
         conn.close()
 
@@ -46,25 +70,42 @@ def write_transaction():
     API or the gRPC service) can write in between. That makes "check the key,
     then insert the booking" safe even when two retries arrive at the same moment.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_lock:
+        conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+        conn.row_factory = sqlite3.Row
         try:
-            yield conn
-        except BaseException:
-            conn.execute("ROLLBACK")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise StorageBusy("database busy") from exc
             raise
-        conn.execute("COMMIT")
-    finally:
-        conn.close()
+        finally:
+            conn.close()
 
 
 def init_db() -> None:
-    """Create the database file and bookings table if they don't exist yet."""
+    """Create the database file and tables if they don't exist yet."""
     folder = os.path.dirname(DB_PATH)
     if folder:
         os.makedirs(folder, exist_ok=True)
+    # WAL (write-ahead log) mode: the right mode when several processes - here
+    # the HTTP and gRPC containers - use one SQLite file. Readers never block
+    # the writer, and SQLite stops creating and deleting a journal file on every
+    # write, which under heavy load from two processes caused "disk I/O error".
+    # The setting is stored in the database file, so it only has to be set once.
+    raw = sqlite3.connect(DB_PATH, timeout=5)
+    try:
+        raw.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass        # the other container is switching it at this moment; it ends up WAL either way
+    finally:
+        raw.close()
     with connect() as conn:
         conn.execute(
             """
@@ -175,7 +216,7 @@ def insert_booking(booking: dict, idempotency_key: str | None = None,
 
 def delete_booking(booking_id: str) -> bool:
     """Delete a booking by its ID. Returns True if one was deleted."""
-    with connect() as conn:
+    with write_transaction() as conn:
         cursor = conn.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
     return cursor.rowcount > 0
 
