@@ -1,0 +1,37 @@
+// StudySlot gRPC API (Assignment 2, Part B).
+//
+// The gRPC version of the "book a room" operation. The server handler
+// (grpc_server.py) calls the same booking_core.create_booking() as
+// POST /bookings and writes to the same SQLite database, so both APIs
+// follow the same rules and see the same bookings.
+//
+// Generate the Python code (from the repo root):
+//   .venv\Scripts\python -m grpc_tools.protoc -I studyslot/protos --python_out=studyslot --pyi_out=studyslot --grpc_python_out=studyslot studyslot/protos/booking.proto
+
+syntax = "proto3";
+
+package studyslot.v1;
+
+service BookingService {
+  // Book a room for a slot. Errors come back as gRPC status codes:
+  //   INVALID_ARGUMENT - bad input or a broken booking rule (HTTP 422/400)
+  //   ALREADY_EXISTS   - the room is already booked for that slot (HTTP 409)
+  rpc CreateBooking (CreateBookingRequest) returns (Booking);
+}
+
+message CreateBookingRequest {
+  string room = 1;                  // "R1" to "R5"
+  string slot = 2;                  // "09:00" to "16:30"
+  repeated string student_ids = 3;  // every student in the group, each once
+  string idempotency_key = 4;       // optional; same meaning as the HTTP Idempotency-Key header
+}
+
+message Booking {
+  string id = 1;
+  string room = 2;
+  string slot = 3;
+  repeated string student_ids = 4;
+  int32 group_size = 5;
+  string created_at = 6;
+  bool replayed = 7;                // true when an earlier request with the same key already created it
+}

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "StudySlot",
-    "description": "Campus study-room booking service (ESD Assignment 2).\n\n- Every response carries an `X-Request-ID` header. Send your own to correlate calls; otherwise one is generated. The same ID appears in the logs and in error bodies.\n- Every error uses the `ErrorResponse` shape: `{\"error\": {\"code\", \"message\", \"request_id\", \"details\"}}`.\n- `POST /bookings` accepts an `Idempotency-Key` header so retries are safe.\n- `GET /availability` is rate limited to 5 calls per 10 seconds per client IP.",
+    "description": "Campus study-room booking service (ESD Assignment 2).\n\n- Every response carries an `X-Request-ID` header. Send your own to correlate calls; otherwise one is generated. The same ID appears in the logs and in error bodies.\n- W3C Trace Context: send a `traceparent` header to join an existing trace. The response `traceparent` carries the same trace-id with this service's span-id, and every log line includes `trace.id` (shared with the gRPC service for the same trace).\n- Every error uses the `ErrorResponse` shape: `{\"error\": {\"code\", \"message\", \"request_id\", \"details\"}}`.\n- `POST /bookings` accepts an `Idempotency-Key` header so retries are safe.\n- `GET /availability` is rate limited to 5 calls per 10 seconds per client IP.",
     "version": "2.0.0"
   },
   "paths": {

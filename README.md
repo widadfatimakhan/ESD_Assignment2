@@ -54,6 +54,19 @@ header. Cancel it with `DELETE /bookings/{id}`.
 - **Rate-limit demo (A2):** `python scripts/rate_limit_demo.py`
 - **Tests:** `.venv\Scripts\python -m pytest -v`
 
+## gRPC service (Assignment 2, Part B)
+`studyslot-grpc` serves `BookingService.CreateBooking` on port 50051, using the
+same rules (`booking_core.py`) and database as the HTTP API.
+
+- Contract: `studyslot/protos/booking.proto`
+- Generate code (after changing the .proto):
+  `.venv\Scripts\python -m grpc_tools.protoc -I studyslot/protos --python_out=studyslot --pyi_out=studyslot --grpc_python_out=studyslot studyslot/protos/booking.proto`
+- Call it: `.venv\Scripts\python scripts/grpc_client.py --room R4 --slot 10:00 --students s1 s2 s3`
+  (options: `--key`, `--deadline`, `--trace-id`)
+- HTTP vs gRPC side by side, one shared trace: `.venv\Scripts\python scripts/compare_http_grpc.py`
+- Both servers accept W3C `traceparent` (header / metadata) and log `trace.id`.
+- Call paths: `docs/a2/call-paths.md`
+
 ## Stop and clean up
 - Pause (keeps data): `docker compose stop`
 - Stop and remove containers (keeps named volumes): `docker compose down`

@@ -7,6 +7,7 @@ which status code that becomes.
 """
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -27,6 +28,12 @@ ROOMS = {
 SLOTS = ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
          "12:00", "12:30", "13:00", "13:30", "14:00", "14:30",
          "15:00", "15:30", "16:00", "16:30"]
+
+# Input rules shared by every API. The HTTP API also checks these in its
+# request model; they live here too so the gRPC API enforces exactly the same.
+STUDENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+MAX_STUDENT_IDS = 50
+IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 # --- Errors: one class per broken rule ---
@@ -74,6 +81,10 @@ class BookingNotFound(BookingError):
 
 class IdempotencyKeyReused(BookingError):
     reason = "idempotency_key_reused"
+
+
+class InvalidIdempotencyKey(BookingError):
+    reason = "invalid_idempotency_key"
 
 
 # --- Helpers ---
@@ -144,14 +155,20 @@ def create_booking(room: str, slot: str, student_ids: list[str],
     for the same request, nothing new is created: the original booking comes
     back with replayed=True. That makes it safe for a client to retry.
     """
+    if idempotency_key is not None and not IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key):
+        raise InvalidIdempotencyKey("Idempotency key must be 8-64 letters, digits, '-' or '_'")
     if room not in ROOMS:
         raise UnknownRoom(f"Unknown room '{room}'")
     if slot not in SLOTS:
         raise UnknownSlot(f"Unknown slot '{slot}'")
     if not student_ids:
         raise NoStudents("At least one student ID is required")
-    if any(not sid.strip() for sid in student_ids):
-        raise InvalidStudentIds("Student IDs cannot be blank")
+    if len(student_ids) > MAX_STUDENT_IDS:
+        raise InvalidStudentIds(f"At most {MAX_STUDENT_IDS} student IDs per booking")
+    malformed = [sid for sid in student_ids if not STUDENT_ID_PATTERN.fullmatch(sid)]
+    if malformed:
+        raise InvalidStudentIds("Student IDs must be 1-32 letters, digits, '-' or '_'",
+                                malformed=malformed[:5])
     duplicates = sorted({sid for sid in student_ids if student_ids.count(sid) > 1})
     if duplicates:
         raise InvalidStudentIds("Each student can only be listed once", duplicates=duplicates)

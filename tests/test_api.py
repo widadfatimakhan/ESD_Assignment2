@@ -173,6 +173,18 @@ def test_request_id_from_caller_is_reused(client):
     assert response.headers["X-Request-ID"] == "my-trace-123"
 
 
+def test_traceparent_is_continued(client):
+    trace_id, caller_span = "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"
+    response = client.get("/rooms", headers={"traceparent": f"00-{trace_id}-{caller_span}-01"})
+    version, returned_trace, server_span, flags = response.headers["traceparent"].split("-")
+    assert returned_trace == trace_id and server_span != caller_span
+
+
+def test_new_trace_is_started_when_none_is_sent(client):
+    version, trace_id, span_id, flags = client.get("/rooms").headers["traceparent"].split("-")
+    assert len(trace_id) == 32 and len(span_id) == 16
+
+
 def test_committed_openapi_json_matches_the_code():
     """If this fails, the API changed: run  python scripts/export_openapi.py  and commit."""
     committed = json.loads((REPO_ROOT / "openapi.json").read_text(encoding="utf-8"))
