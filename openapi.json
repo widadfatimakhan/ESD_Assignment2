@@ -507,48 +507,6 @@
         }
       }
     },
-    "/chaos/cardinality": {
-      "put": {
-        "tags": [
-          "chaos"
-        ],
-        "summary": "Set Cardinality",
-        "description": "Arm or disarm the cardinality bomb (per-request_id metric label).",
-        "operationId": "set_cardinality_chaos_cardinality_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CardinalitySetting"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChaosState"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Invalid input or broken booking rule",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/chaos/failures": {
       "put": {
         "tags": [
@@ -716,28 +674,11 @@
           }
         ]
       },
-      "CardinalitySetting": {
-        "properties": {
-          "active": {
-            "type": "boolean",
-            "title": "Active"
-          }
-        },
-        "type": "object",
-        "required": [
-          "active"
-        ],
-        "title": "CardinalitySetting"
-      },
       "ChaosState": {
         "properties": {
           "delay_seconds": {
             "type": "number",
             "title": "Delay Seconds"
-          },
-          "cardinality_bomb": {
-            "type": "boolean",
-            "title": "Cardinality Bomb"
           },
           "fail_next_bookings": {
             "type": "integer",
@@ -747,7 +688,6 @@
         "type": "object",
         "required": [
           "delay_seconds",
-          "cardinality_bomb",
           "fail_next_bookings"
         ],
         "title": "ChaosState"

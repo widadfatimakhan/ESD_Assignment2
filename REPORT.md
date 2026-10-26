@@ -56,7 +56,7 @@ The chosen **user task** is *a student books a study room*.
 | — | `GET /bookings/{id}` → `200` / `404` | Added: the `Location` header must point at something real. |
 | `GET /availability` | Same path; `group_size` must be 1–50; unknown slot → `422`; rate limited (A.5) | Changed (validation, rate limit). |
 | `POST /chaos/delay?seconds=` | `PUT /chaos/delay` with body `{"seconds": 0–10}` | Changed: PUT sets a value, so repeating it is harmless; the value is validated. |
-| `POST /chaos/cardinality?active=` | `PUT /chaos/cardinality` with body `{"active": true}` | Changed, same reason. |
+| `POST /chaos/cardinality?active=` | — | Removed: the A1 cardinality experiment is finished, and its metric used a request-ID label (see C.1). |
 | `GET /chaos/status` | `GET /chaos` (all switches) | Changed. |
 | — | `PUT /chaos/failures` with body `{"count": N}` | Added: the next N bookings fail with 503, for the caller demo. |
 | `GET /rooms`, `GET /bookings`, `GET /` | Same paths; response shapes now documented | Left alone: already clear and correct. |
@@ -346,7 +346,7 @@ replays over gRPC.
 | `studyslot_rooms_occupied` | Gauge | Useful, but A1 added and subtracted in memory, so it was wrong after a restart and blind to gRPC bookings. | **Fixed:** reads the count from the database at every scrape (`set_function`). |
 | `studyslot_availability_check_seconds` | Histogram | Kept for the A1 dashboard, but misnamed: it times the whole booking (including the database write), and only for HTTP. | **Kept**; superseded by `http_request_duration_seconds` for request latency. |
 | `studyslot_availability_check_summary_seconds` | Summary | Duplicate of the histogram. The Python client's Summary exports no quantiles, and summaries cannot be aggregated across instances. | **Removed.** The A1 "average" panel now uses the histogram's `_sum / _count`. |
-| `studyslot_requests_by_id_total` | Counter | Deliberately unsafe (`request_id` label), for the A1 cardinality experiment. | Kept behind its chaos switch (off by default); would be deleted in production. |
+| `studyslot_requests_by_id_total` | Counter | Deliberately unsafe (`request_id` label), for the A1 cardinality experiment. Every request created a new time series. | **Removed**, with its chaos switch: request IDs must never be labels. |
 | `node_*` | Node Exporter | Useful machine view. | Unchanged. |
 
 **Missing in A1:** request rate, errors and duration per HTTP route (only

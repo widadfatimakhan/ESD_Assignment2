@@ -56,14 +56,6 @@ app = FastAPI(
 # counters studyslot_bookings_total and studyslot_idempotent_replays_total
 # now live in metrics.py so the gRPC service reports them too.
 # ---------------------------------------------------------------------------
-# DELIBERATELY BAD metric for the A1 cardinality experiment: a per-request-ID label.
-CARDINALITY_DEMO = Counter(
-    "studyslot_requests_by_id_total",
-    "UNSAFE demo: one series per unique request_id",
-    ["request_id"],
-)
-CARDINALITY_BOMB_ON = False
-
 # Reads the count from the database at every scrape, so it stays correct after
 # restarts and when the gRPC service changes bookings too.
 ROOMS_OCCUPIED = Gauge(
@@ -365,17 +357,12 @@ class DelaySetting(BaseModel):
     seconds: float = Field(ge=0, le=10, description="Delay added to each booking's availability check; 0 turns it off")
 
 
-class CardinalitySetting(BaseModel):
-    active: bool
-
-
 class FailureSetting(BaseModel):
     count: int = Field(ge=0, le=100, description="How many of the next POST /bookings requests fail with 503; 0 turns it off")
 
 
 class ChaosState(BaseModel):
     delay_seconds: float
-    cardinality_bomb: bool
     fail_next_bookings: int
 
 
@@ -461,8 +448,6 @@ def create_booking(
     if consume_injected_failure():     # chaos: simulated outage
         log_event("booking failed", level="ERROR", status=503, reason="injected_failure")
         raise InjectedFailure()
-    if CARDINALITY_BOMB_ON:
-        CARDINALITY_DEMO.labels(request_id=request_id_var.get()).inc()
 
     start = time.perf_counter()        # stopwatch for the availability check
     time.sleep(INJECTED_DELAY)         # chaos: 0 normally; >0 when delay is injected
@@ -534,8 +519,7 @@ def metrics():
 
 # --- Chaos switches (from A1) ---
 def chaos_state() -> dict:
-    return {"delay_seconds": INJECTED_DELAY, "cardinality_bomb": CARDINALITY_BOMB_ON,
-            "fail_next_bookings": FAIL_NEXT_BOOKINGS}
+    return {"delay_seconds": INJECTED_DELAY, "fail_next_bookings": FAIL_NEXT_BOOKINGS}
 
 
 @app.get("/chaos", response_model=ChaosState, tags=["chaos"])
@@ -550,15 +534,6 @@ def set_delay(setting: DelaySetting):
     global INJECTED_DELAY
     INJECTED_DELAY = setting.seconds
     log_event("chaos delay set", level="WARNING", injected_delay_seconds=setting.seconds)
-    return chaos_state()
-
-
-@app.put("/chaos/cardinality", response_model=ChaosState, responses=errors(422), tags=["chaos"])
-def set_cardinality(setting: CardinalitySetting):
-    """Arm or disarm the cardinality bomb (per-request_id metric label)."""
-    global CARDINALITY_BOMB_ON
-    CARDINALITY_BOMB_ON = setting.active
-    log_event("chaos cardinality set", level="WARNING", cardinality_bomb=setting.active)
     return chaos_state()
 
 

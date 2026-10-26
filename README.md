@@ -81,7 +81,7 @@ does not need to be running.
 
 Chaos switches (from Swagger UI): `PUT /chaos/delay {"seconds": 0.5}`,
 `PUT /chaos/failures {"count": 3}` (the next 3 bookings fail with 503),
-`PUT /chaos/cardinality {"active": true}`, and `GET /chaos` for the current state.
+and `GET /chaos` for the current state.
 
 ## gRPC
 - Contract: `studyslot/protos/booking.proto`

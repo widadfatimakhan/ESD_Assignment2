@@ -31,7 +31,6 @@ def client():
     main.availability_limiter.reset()
     main.INJECTED_DELAY = 0.0
     main.FAIL_NEXT_BOOKINGS = 0
-    main.CARDINALITY_BOMB_ON = False
     return TestClient(main.app)
 
 
