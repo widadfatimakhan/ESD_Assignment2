@@ -84,7 +84,8 @@ services:
     container_name: studyslot-grpc
     command: ["python", "-u", "grpc_server.py"]
     ports:
-      - "50051:50051"
+      - "50051:50051"   # gRPC
+      - "9101:9101"     # Prometheus metrics (Part C)
     environment:
       - STUDYSLOT_DB_PATH=/data/studyslot.db
       - SERVICE_NAME=studyslot-grpc

@@ -190,3 +190,17 @@ def test_committed_openapi_json_matches_the_code():
     committed = json.loads((REPO_ROOT / "openapi.json").read_text(encoding="utf-8"))
     current = json.loads(json.dumps(main.app.openapi()))
     assert committed == current
+
+
+# --- Database busy: a retryable 503, never a 500 ---------------------------------
+def test_busy_database_returns_503_with_retry_after(client, booking_body, monkeypatch):
+    import db
+
+    def always_busy(*args, **kwargs):
+        raise db.StorageBusy("database busy")
+
+    monkeypatch.setattr(db, "insert_booking", always_busy)
+    response = client.post("/bookings", json=booking_body)
+
+    assert_error(response, 503, "storage_busy")
+    assert response.headers["Retry-After"] == "1"

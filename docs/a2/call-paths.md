@@ -13,13 +13,13 @@ flowchart TB
     end
 
     subgraph HTTPC["Container: studyslot-app (port 8000)"]
-        MW["FastAPI middleware<br/>child span from traceparent,<br/>X-Request-ID"]
+        MW["FastAPI middleware<br/>request metrics; child span from traceparent;<br/>X-Request-ID"]
         ROUTE["Route handler<br/>main.py · create_booking()<br/>POST /bookings"]
         MW --> ROUTE
     end
 
     subgraph GRPCC["Container: studyslot-grpc (port 50051)"]
-        INT["TracingInterceptor<br/>child span from traceparent metadata,<br/>x-request-id"]
+        INT["MetricsInterceptor → TracingInterceptor<br/>request metrics; child span from traceparent metadata;<br/>x-request-id"]
         SVC["Server handler<br/>grpc_server.py · BookingService.CreateBooking()<br/>(subclass of generated BookingServiceServicer)"]
         INT --> SVC
     end
@@ -41,7 +41,7 @@ flowchart TB
 | Transport | HTTP/1.1, JSON body | HTTP/2, protobuf body |
 | Trace context (W3C) | `traceparent` header in, `traceparent` header out | `traceparent` metadata in, `traceparent` response metadata out |
 | Logged as | `trace.id`, `span.id`, `span.parent_id`, `request_id` | the same fields, `service.name = studyslot-grpc` |
-| Server entry | FastAPI middleware → route `create_booking()` in `main.py` | `TracingInterceptor` → `BookingService.CreateBooking()` in `grpc_server.py` |
+| Server entry | FastAPI middleware (metrics, tracing) → route `create_booking()` in `main.py` | `MetricsInterceptor` → `TracingInterceptor` → `BookingService.CreateBooking()` in `grpc_server.py` |
 | Business rules | `booking_core.create_booking()` | `booking_core.create_booking()` (same function) |
 | Storage | `db.insert_booking()` → SQLite on volume `studyslot-data` | same function, same file |
 | Errors | `BookingError` → HTTP status + JSON error body | `BookingError` → gRPC status code + `error-code` trailing metadata |

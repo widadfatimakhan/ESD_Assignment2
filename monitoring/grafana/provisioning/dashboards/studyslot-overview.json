@@ -297,14 +297,14 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "rate(studyslot_availability_check_summary_seconds_sum[5m]) / rate(studyslot_availability_check_summary_seconds_count[5m])",
+          "expr": "rate(studyslot_availability_check_seconds_sum[5m]) / rate(studyslot_availability_check_seconds_count[5m])",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Availability check average (seconds)",
+      "title": "Availability check average (seconds, from histogram _sum/_count)",
       "type": "timeseries"
     },
     {
