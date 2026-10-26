@@ -127,13 +127,14 @@ def grpc_worker(room: str, slot: str, stop_at: float) -> None:
             time.sleep(PAUSE)
 
 
-def run_phase(name: str, workers: int, pause: float, seconds: int) -> None:
-    """Start `workers` threads per API (HTTP on R4, gRPC on R5, one slot each) for `seconds`."""
+def run_phase(name: str, workers: int, pause: float, seconds: int, free: dict) -> None:
+    """Start `workers` threads per API (HTTP on R4, gRPC on R5, one FREE slot each) for `seconds`."""
     global PAUSE
     PAUSE = pause
+    workers = min(workers, len(free["R4"]), len(free["R5"]))
     stop_at = time.monotonic() + seconds
-    threads = [threading.Thread(target=http_worker, args=("R4", SLOTS[i], stop_at)) for i in range(workers)]
-    threads += [threading.Thread(target=grpc_worker, args=("R5", SLOTS[i], stop_at)) for i in range(workers)]
+    threads = [threading.Thread(target=http_worker, args=("R4", free["R4"][i], stop_at)) for i in range(workers)]
+    threads += [threading.Thread(target=grpc_worker, args=("R5", free["R5"][i], stop_at)) for i in range(workers)]
     print(f"[{time.strftime('%H:%M:%S')}] {name}: {workers} workers per API, "
           f"{pause}s pause, {seconds}s...")
     for t in threads:
@@ -160,9 +161,17 @@ def main() -> None:
         if booking["student_ids"] == STUDENTS:
             http.delete(f"/bookings/{booking['id']}")
 
-    run_phase("steady", max(1, min(args.workers, 16)), max(0.0, args.pause), args.seconds)
+    # Only use slots nobody else has booked (e.g. earlier demos). A worker on a
+    # taken slot would fail on every call and skew the success/error mix.
+    taken = {(b["room"], b["slot"]) for b in bookings if b["student_ids"] != STUDENTS}
+    free = {room: [slot for slot in SLOTS if (room, slot) not in taken] for room in ("R4", "R5")}
+    for room, slot in sorted(taken):
+        if room in free:
+            print(f"Skipping {room} {slot}: already booked by someone else")
+
+    run_phase("steady", max(1, min(args.workers, 16)), max(0.0, args.pause), args.seconds, free)
     if args.burst_seconds > 0:
-        run_phase("burst", max(1, min(args.burst_workers, 16)), 0.0, args.burst_seconds)
+        run_phase("burst", max(1, min(args.burst_workers, 16)), 0.0, args.burst_seconds, free)
     print(f"[{time.strftime('%H:%M:%S')}] done")
 
     print("\nResults (what the dashboards should show):")
