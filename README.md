@@ -6,6 +6,7 @@ its booking operation, instrumented end to end with Prometheus + Grafana
 
 - **Assignment 2** (HTTP APIs, gRPC, metrics): [REPORT.md](REPORT.md)
 - **Assignment 1** (observability): [docs/a1/REPORT.md](docs/a1/REPORT.md)
+- **Video walkthrough:** https://youtu.be/liDCf23rnmo
 
 ## What it does
 Students book a limited group study room for a time slot, listing their group's

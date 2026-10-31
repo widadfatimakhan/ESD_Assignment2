@@ -6,6 +6,7 @@ StudySlot is the campus study-room booking service from Assignment 1. This
 assignment extends it: Part A improves the HTTP API, Part B adds a gRPC version
 of one operation, and Part C extends the metrics. Run and test commands are in
 the [README](README.md). The Assignment 1 report is in [docs/a1/REPORT.md](docs/a1/REPORT.md).
+A video walkthrough is on YouTube: https://youtu.be/liDCf23rnmo
 
 ---
 
